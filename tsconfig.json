@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+
+    "types": ["node"],
+
+    "paths": {
+      "@config/*": ["./src/config/*"],
+      "@common/*": ["./src/common/*"],
+      "@modules/*": ["./src/modules/*"],
+      "@routes/*": ["./src/routes/*"],
+      "@prisma/*": ["./src/prisma/*"],
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

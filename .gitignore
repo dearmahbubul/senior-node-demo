@@ -47,3 +47,12 @@ bower_components/
 *.ntvs*
 *.njsproj
 *.sln
+.agents/
+.claude/
+.windsurf/
+
+# Prisma generated client
+/src/generated/prisma/
+
+# dotenv environment variables
+.env
