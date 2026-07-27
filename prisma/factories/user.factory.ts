@@ -1,21 +1,21 @@
-import { faker } from '@faker-js/faker';
 import bcrypt from 'bcrypt';
-import { prisma } from '../../src/prisma/client';
+import { prisma } from '@prisma/client';
 
 export async function makeUser(
-  overrides: Partial<{ email: string; name: string; password: string }> = {},
+    overrides: Partial<{ email: string; name: string; password: string}> = {},
 ) {
-  const passwordHash = await bcrypt.hash(overrides.password ?? 'password123', 12);
+    const { faker } = await import('@faker-js/faker');
+    const passwordHash = await bcrypt.hash(overrides.password ?? 'password123', 12);
 
-  return prisma.user.create({
-    data: {
-      email: overrides.email ?? faker.internet.email().toLowerCase(),
-      passwordHash,
-      name: overrides.name ?? faker.person.fullName(),
-    },
-  });
+    return prisma.user.create({
+        data: {
+            email: overrides.email ?? faker.internet.email().toLowerCase(),
+            passwordHash,
+            name: overrides.name ?? faker.person.fullName(),
+        },
+    });
 }
 
 export async function makeUsers(count: number) {
-  return Promise.all(Array.from({ length: count }, () => makeUser()));
+    return Promise.all(Array.from({ length: count }, () => makeUser()));
 }

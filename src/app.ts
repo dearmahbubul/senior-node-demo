@@ -1,46 +1,33 @@
 import express, { Express } from 'express';
+import swaggerUi from 'swagger-ui-express';
 import helmet from 'helmet';
 import cors from 'cors';
 import compression from 'compression';
 import pinoHttp from 'pino-http';
 import { logger } from './common/logger';
 import { errorHandler } from './common/middleware/errorHandler';
+import { generateOpenApiDocument } from './common/openapi/document';
 import routes from './routes';
 
 export function createApp(): Express {
-  const app = express();
+    const app = express();
 
-  // Security headers — always first
-  app.use(helmet());
+    app.use(helmet());
+    app.use(cors());
+    app.use(compression());
+    app.use(express.json({ limit: '10kb' }));
+    app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+    app.use(pinoHttp({ logger }));
 
-  // CORS — restrict in production via env-driven allowlist later
-  app.use(cors());
+    app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
-  // Gzip responses
-  app.use(compression());
+    const openApiDocument = generateOpenApiDocument();
+    app.get('/openapi.json', (_req, res) => res.json(openApiDocument));
+    app.use('/docs', swaggerUi.serve, swaggerUi.setup(openApiDocument));
 
-  // Parse JSON bodies, with a sane size limit (prevents payload-based DoS)
-  app.use(express.json({ limit: '10kb' }));
-  app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+    app.use('/api', routes);
+    app.use((_req, res) => res.status(404).json({ error: 'Route not found' }));
+    app.use(errorHandler);
 
-  // Structured request logging
-  app.use(pinoHttp({ logger }));
-
-  // Health check — every deployable service needs one (Kubernetes will use this later)
-  app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok' });
-  });
-
-  // API routes
-  app.use('/api', routes);
-
-  // 404 handler — must come after all real routes
-  app.use((req, res) => {
-    res.status(404).json({ error: 'Route not found' });
-  });
-
-  // Centralized error handler — must be last
-  app.use(errorHandler);
-
-  return app;
+    return app;
 }
