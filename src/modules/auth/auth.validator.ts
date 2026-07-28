@@ -1,0 +1,1 @@
+export { loginSchema } from './dto/login.dto';

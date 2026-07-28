@@ -4,9 +4,9 @@ import helmet from 'helmet';
 import cors from 'cors';
 import compression from 'compression';
 import pinoHttp from 'pino-http';
-import { logger } from './common/logger';
-import { errorHandler } from './common/middleware/errorHandler';
-import { generateOpenApiDocument } from './common/openapi/document';
+import { logger } from '@common/logger';
+import { errorHandler } from '@common/middleware/errorHandler';
+import { generateOpenApiDocument } from '@common/openapi/document';
 import routes from './routes';
 
 export function createApp(): Express {
