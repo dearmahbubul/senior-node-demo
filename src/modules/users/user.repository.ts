@@ -8,6 +8,6 @@ export const userRepository = {
   findByEmail: (email: string): Promise<User | null> =>
     prisma.user.findUnique({ where: { email } }),
 
-  findById: (id: number): Promise<User | null> =>
+  findById: (id: string): Promise<User | null> =>
     prisma.user.findUnique({ where: { id } }),
 };

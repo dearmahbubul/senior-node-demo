@@ -1,11 +1,11 @@
 import bcrypt from 'bcrypt';
 import { userRepository } from './user.repository';
 import { CreateUserDto } from './dto/create-user.dto';
-import { AppError } from '../../common/errors/AppError';
+import { AppError } from '@common/errors/AppError';
 
 const SALT_ROUNDS = 12;
 
-function toSafeUser(user: { id: number; email: string; name: string | null; createdAt: Date }) {
+function toSafeUser(user: { id: string; email: string; name: string | null; createdAt: Date }) {
   return { id: user.id, email: user.email, name: user.name, createdAt: user.createdAt };
 }
 
@@ -26,7 +26,7 @@ export const userService = {
     return toSafeUser(user);
   },
 
-  async getUserById(id: number) {
+  async getUserById(id: string) {
     const user = await userRepository.findById(id);
     if (!user) throw new AppError('User not found', 404);
     return toSafeUser(user);

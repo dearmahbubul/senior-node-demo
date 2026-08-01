@@ -13,7 +13,7 @@ export const userController = {
 
   getById: async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = await userService.getUserById(Number(req.params.id));
+      const user = await userService.getUserById(<string>req.params.id);
       res.status(200).json(user);
     } catch (err) {
       next(err);

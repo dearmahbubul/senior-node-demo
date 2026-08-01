@@ -6,6 +6,8 @@ export const envSchema = z.object({
   DATABASE_URL: z.url(),
   JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 characters'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  RABBITMQ_URL: z.url().default('amqp://admin:admin@localhost:5672'),
+  REDIS_URL: z.url().default('redis://localhost:6379'),
 });
 
 export type Env = z.infer<typeof envSchema>;

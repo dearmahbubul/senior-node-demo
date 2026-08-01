@@ -18,4 +18,6 @@ export const env = {
   databaseUrl: raw.DATABASE_URL,
   jwtSecret: raw.JWT_SECRET,
   logLevel: raw.LOG_LEVEL,
+  rabbitmqUrl: raw.RABBITMQ_URL,
+  redisUrl: raw.REDIS_URL,
 };

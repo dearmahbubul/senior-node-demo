@@ -8,13 +8,32 @@ datasource db {
   provider = "postgresql"
 }
 
-model User {
-  id           Int      @id @default(autoincrement())
-  email        String   @unique
-  passwordHash String   @map("password_hash")
-  name         String?
-  phone        String?  @map("phone")
-  createdAt    DateTime @default(now()) @map("created_at")
+enum TaskStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  DONE
+}
 
-  @@map("users")
+model User {
+  id            String   @id @default(uuid())
+  name          String?
+  email         String   @unique
+  passwordHash  String
+  phone         String?
+  createdAt     DateTime @default(now())
+  tasksCreated  Task[]   @relation("TaskCreator")
+  tasksAssigned Task[]   @relation("TaskAssignee")
+}
+
+model Task {
+  id           String     @id @default(uuid())
+  title        String
+  description  String?    @db.Text
+  status       TaskStatus @default(PENDING)
+  createdAt    DateTime   @default(now())
+  userId       String
+  user         User       @relation("TaskCreator", fields: [userId], references: [id])
+  assignedToId String?
+  assignedTo   User?      @relation("TaskAssignee", fields: [assignedToId], references: [id])
 }

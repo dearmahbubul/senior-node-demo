@@ -2,7 +2,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '@config/env';
 
 export interface JwtPayload {
-    sub: number; // user id — "sub" is the JWT-standard claim name for subject
+    sub: string; // user id — "sub" is the JWT-standard claim name for subject
     email: string;
 }
 
@@ -11,5 +11,5 @@ export function signAccessToken(payload: JwtPayload): string {
 }
 
 export function verifyAccessToken(token: string): JwtPayload {
-    return jwt.verify(token, env.jwtSecret) as JwtPayload;
+    return jwt.verify(token, env.jwtSecret) as unknown as JwtPayload;
 }

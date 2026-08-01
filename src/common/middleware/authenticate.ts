@@ -10,7 +10,7 @@ declare global {
     }
 }
 
-export function authenticate(req: Request, res: Response, next: NextFunction) {
+export function authenticate(req: Request, _res: Response, next: NextFunction) {
     const header = req.headers.authorization;
 
     if (!header || !header.startsWith('Bearer ')) {
