@@ -1,4 +1,4 @@
-import { prisma } from '../../prisma/client';
+import { prisma } from '@prisma/client';
 import { User } from '../../generated/prisma/client';
 
 export const userRepository = {

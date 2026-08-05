@@ -1,33 +1,37 @@
 {
-  "compilerOptions": {
-    "target": "ES2023",
-    "lib": ["ES2023"],
-    "module": "nodenext",
-    "moduleResolution": "nodenext",
-    "rootDir": "./src",
-    "outDir": "./dist",
+    "compilerOptions": {
+        "target": "ES2023",
+        "lib": ["ES2023"],
+        "module": "nodenext",
+        "moduleResolution": "nodenext",
+        "rootDir": "./src",
+        "outDir": "./dist",
 
-    "strict": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
+        "strict": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "noImplicitReturns": true,
+        "noFallthroughCasesInSwitch": true,
 
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
-    "resolveJsonModule": true,
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "skipLibCheck": true,
+        "resolveJsonModule": true,
 
-    "types": ["node"],
+        "types": ["node"],
 
-    "paths": {
-      "@config/*": ["./src/config/*"],
-      "@common/*": ["./src/common/*"],
-      "@modules/*": ["./src/modules/*"],
-      "@routes/*": ["./src/routes/*"],
-      "@prisma/*": ["./src/prisma/*"],
-    }
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+        "typeRoots": [
+            "./node_modules/@types" // Keeps standard packages working (Express, Jest, etc.)
+        ],
+
+        "paths": {
+            "@config/*": ["./src/config/*"],
+            "@common/*": ["./src/common/*"],
+            "@modules/*": ["./src/modules/*"],
+            "@routes/*": ["./src/routes/*"],
+            "@prisma/*": ["./src/prisma/*"]
+        }
+    },
+    "include": ["src/**/*", "src/common/declarations/**/*.d.ts"],
+    "exclude": ["node_modules", "dist"]
 }
