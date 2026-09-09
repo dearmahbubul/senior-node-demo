@@ -56,3 +56,5 @@ bower_components/
 
 # dotenv environment variables
 .env
+
+uploads/

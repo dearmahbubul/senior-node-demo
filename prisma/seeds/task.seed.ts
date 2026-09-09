@@ -1,4 +1,4 @@
-import { prisma } from '@prisma/client';
+import { prisma } from '../../src/prisma/client';
 import { makeTasks } from '../factories/task.factory';
 
 export async function seedTasks() {

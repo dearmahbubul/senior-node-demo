@@ -24,11 +24,13 @@ export const authController = {
      * Resolves the profile identity of the current bearer session.
      */
     me: asyncHandler(async (req: Request, res: Response<ApiResponse>) => {
-        // req.user is supplied down the request chain via your authenticate JWT middleware
+        // req.user holds only JWT claims; hydrate the fresh DB record via the sub claim
+        const user = await authService.getMe(req.user!.sub);
+
         res.status(200).json({
             success: true,
             message: 'Current active session context resolved',
-            data: authResource.me(req.user), // Cleanly filters out hidden database artifacts
+            data: authResource.me(user), // Cleanly filters out hidden database artifacts
             meta: { timestamp: new Date().toISOString() },
         });
     }),

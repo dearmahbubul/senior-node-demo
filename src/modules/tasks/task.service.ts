@@ -1,25 +1,40 @@
 import { taskRepository } from './task.repository';
 import { CreateTaskInput, UpdateTaskStatusInput } from './task.validator';
 import { AppError } from '@common/errors/AppError';
-import { TaskStatus } from '../../generated/prisma/enums';
+import { NotFoundError } from '@common/errors/NotFoundError';
+import { TaskStatus } from '@generated/prisma/enums';
+import { userRepository } from '@modules/users/user.repository';
+import { emitTaskAssigned } from '@common/events/task.events';
 
 export const taskService = {
     /**
      * Prepares incoming inputs, forces business defaults, and triggers creation.
+     * The creator is injected server-side from the authenticated subject.
+     * If the task is born already-assigned, the assignee notification is emitted.
      */
-    async createTask(input: CreateTaskInput) {
-        const taskPayload = {
+    async createTask(input: CreateTaskInput, creatorId: string) {
+        if (input.assignedToId) {
+            await this.assertAssigneeExists(input.assignedToId);
+        }
+
+        const task = await taskRepository.createWithRelations({
             title: input.title,
             description: input.description ?? null,
-            userId: input.userId,
+            userId: creatorId,
             assignedToId: input.assignedToId ?? null,
             status: TaskStatus.PENDING, // Core system design rule
-        };
+        });
 
-        // return taskRepository.create(taskPayload);
+        if (input.assignedToId) {
+            await emitTaskAssigned({
+                taskId: task.id,
+                taskTitle: task.title,
+                assignedToId: input.assignedToId,
+                assignerName: task.user?.name ?? null,
+            });
+        }
 
-        // Returns the task along with user and assignee details immediately
-        return taskRepository.createWithRelations(taskPayload);
+        return task;
     },
 
     /**
@@ -28,8 +43,7 @@ export const taskService = {
     async getTaskById(id: string) {
         const task = await taskRepository.findByIdWithRelations(id);
         if (!task) {
-            throw new AppError(
-                404,
+            throw new NotFoundError(
                 `Task resource with ID ${id} does not exist.`,
                 'TASK_NOT_FOUND',
             );
@@ -46,15 +60,19 @@ export const taskService = {
 
     /**
      * Modifies the operational owner assigned to handle a task tracking stream.
+     * Emits a task.assigned event consumed by the notification worker.
      */
     async assignTask(id: string, assigneeId: string | null) {
         const task = await taskRepository.findById(id);
         if (!task) {
-            throw new AppError(
-                404,
+            throw new NotFoundError(
                 'Task resource missing for allocation update.',
                 'TASK_NOT_FOUND',
             );
+        }
+
+        if (assigneeId && task.assignedToId !== assigneeId) {
+            await this.assertAssigneeExists(assigneeId);
         }
 
         // Guard rule: Blocks modifications to completed tasks
@@ -75,7 +93,27 @@ export const taskService = {
                     : task.status,
         };
 
-        return taskRepository.update(id, updatePayload);
+        const updated = await taskRepository.update(id, updatePayload);
+
+        // Notify only on a real (re-)assignment, not on unassignment
+        if (assigneeId && assigneeId !== task.assignedToId) {
+            await emitTaskAssigned({
+                taskId: updated.id,
+                taskTitle: updated.title,
+                assignedToId: assigneeId,
+                assignerName: null, // worker hydrates names from DB
+            });
+        }
+
+        return updated;
+    },
+
+    async assertAssigneeExists(userId: string) {
+        const user = await userRepository.findById(userId);
+        if (!user) {
+            throw new NotFoundError(`Assignee with ID ${userId} does not exist.`, 'USER_NOT_FOUND');
+        }
+        return user;
     },
 
     /**
@@ -84,8 +122,7 @@ export const taskService = {
     async updateTaskStatus(id: string, data: UpdateTaskStatusInput) {
         const task = await taskRepository.findById(id);
         if (!task) {
-            throw new AppError(
-                404,
+            throw new NotFoundError(
                 'Task resource missing for status transition.',
                 'TASK_NOT_FOUND',
             );
@@ -121,7 +158,7 @@ export const taskService = {
     async deleteTask(id: string) {
         const task = await taskRepository.findById(id);
         if (!task) {
-            throw new AppError(404, 'Task resource missing for erasure process.', 'TASK_NOT_FOUND');
+            throw new NotFoundError('Task resource missing for erasure process.', 'TASK_NOT_FOUND');
         }
 
         return taskRepository.delete(id);

@@ -3,7 +3,16 @@ import { RedisStore, type RedisReply } from 'rate-limit-redis';
 import Redis from 'ioredis';
 import { env } from '@config/env';
 
-const redisClient = new Redis(env.redisUrl);
+export const redisClient = new Redis(env.redisUrl);
+
+redisClient.on('error', (err) => {
+    // Without a handler an 'error' event crashes the whole Node process
+    console.error('Redis error:', err.message);
+});
+
+export async function closeRedis(): Promise<void> {
+    await redisClient.quit();
+}
 
 export const loginRateLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,

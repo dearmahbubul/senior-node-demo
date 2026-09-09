@@ -1,5 +1,5 @@
 import bcrypt from 'bcrypt';
-import { prisma } from '@prisma/client';
+import { prisma } from '../../src/prisma/client';
 
 export async function makeUser(
     overrides: Partial<{ email: string; name: string; password: string}> = {},

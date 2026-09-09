@@ -1,3 +1,5 @@
+import { User } from '@generated/prisma/client';
+
 export interface AuthUserResponse {
     id: string;
     email: string;
@@ -13,7 +15,7 @@ export const authResource = {
     /**
      * Sanitizes and shapes the final authorization response package
      */
-    toAuthPayload(user: any, token: string): AuthSuccessResponse {
+    toAuthPayload(user: User, token: string): AuthSuccessResponse {
         return {
             token,
             user: {
@@ -27,7 +29,7 @@ export const authResource = {
     /**
      * Safe mapping transformer for user identity profiles (/me endpoint)
      */
-    me(user: any): AuthUserResponse {
+    me(user: User): AuthUserResponse {
         return {
             id: user.id,
             email: user.email,

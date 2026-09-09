@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { AppError } from '../errors/AppError';
+import { logger } from '@common/logger';
 import { ApiResponse } from '../types/response';
 
 export const globalErrorHandler = (
@@ -8,36 +9,27 @@ export const globalErrorHandler = (
     res: Response<ApiResponse>,
     _next: NextFunction,
 ) => {
+    // Known, intentional errors (AppError family): warn-level is enough.
+    // Unknown errors: log the full stack — this is what you debug incidents with.
+    if (err instanceof AppError) {
+        logger.warn({ err, code: err.code }, err.message);
+    } else {
+        logger.error({ err }, 'Unhandled error');
+    }
+
     const statusCode = err instanceof AppError ? err.statusCode : 500;
     const errorCode = err instanceof AppError ? err.code : 'INTERNAL_SERVER_ERROR';
 
-    // High-reliability logging system integration goes here (e.g., Winston/Datadog)
-    console.error(`[API ERROR] [${errorCode}]:`, err);
-
     res.status(statusCode).json({
         success: false,
-        message: err.message || 'An unexpected error occurred on the server.',
+        message:
+            statusCode >= 500 && process.env.NODE_ENV === 'production'
+                ? 'An unexpected error occurred on the server.'
+                : err.message || 'An unexpected error occurred on the server.',
         error: {
             code: errorCode,
-            // Provide deep contextual details in development; mask strings in production
             details: err instanceof AppError ? err.details : null,
         },
         meta: { timestamp: new Date().toISOString() },
     });
 };
-
-
-/*
-import { Request, Response, NextFunction } from 'express';
-import { AppError } from '../errors/AppError';
-import { logger } from '../logger';
-
-export function errorHandler(err: Error, _req: Request, res: Response, _next: NextFunction) {
-  if (err instanceof AppError) {
-    logger.warn({ err }, err.message);
-    return res.status(err.status).json({ error: err.message });
-  }
-
-  logger.error({ err }, 'Unhandled error');
-  return res.status(500).json({ error: 'Internal Server Error' });
-}*/

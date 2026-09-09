@@ -29,7 +29,8 @@
             "@common/*": ["./src/common/*"],
             "@modules/*": ["./src/modules/*"],
             "@routes/*": ["./src/routes/*"],
-            "@prisma/*": ["./src/prisma/*"]
+            "@db/*": ["./src/prisma/*"],
+            "@generated/*": ["./src/generated/*"]
         }
     },
     "include": ["src/**/*", "src/common/declarations/**/*.d.ts"],

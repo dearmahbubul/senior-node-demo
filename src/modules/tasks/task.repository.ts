@@ -1,7 +1,7 @@
-import { prisma } from '@prisma/client';
-import { Task, Prisma } from '../../generated/prisma/client';
+import { prisma } from '@db/client';
+import { Task, Prisma } from '@generated/prisma/client';
 
-// Standardized performance filter to block passwordHash column downloads at the DB level
+// Limits fetched user columns to safe fields only — passwordHash never leaves the DB
 const safeUserSelect = { select: { id: true, name: true, email: true } };
 
 export const taskRepository = {

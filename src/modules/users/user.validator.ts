@@ -38,6 +38,7 @@ registry.registerPath({
     path: '/api/users',
     tags: ['User'],
     summary: 'Register a new user',
+    security: [{ bearerAuth: [] }],
     request: {
         body: {
             content: {
@@ -56,6 +57,7 @@ registry.registerPath({
     path: '/api/users/{id}',
     tags: ['User'],
     summary: 'Retrieve user details by ID',
+    security: [{ bearerAuth: [] }],
     request: {
         params: getUserParamsSchema.shape.params,
     },

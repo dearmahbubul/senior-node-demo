@@ -2,6 +2,7 @@ import bcrypt from 'bcrypt';
 import { userRepository } from '../users/user.repository';
 import { LoginDto } from './auth.validator';
 import { AppError } from '@common/errors/AppError';
+import { NotFoundError } from '@common/errors/NotFoundError';
 import { signAccessToken } from './token.util';
 
 export const authService = {
@@ -29,5 +30,17 @@ export const authService = {
         const token = signAccessToken({ sub: user.id, email: user.email });
 
         return { token, user };
+    },
+
+    /**
+     * Resolves the CURRENT database record for an authenticated subject.
+     * Token claims are a snapshot — name/role changes must be reflected here.
+     */
+    async getMe(userId: string) {
+        const user = await userRepository.findById(userId);
+        if (!user) {
+            throw new NotFoundError('User for this session no longer exists.', 'USER_NOT_FOUND');
+        }
+        return user;
     },
 };

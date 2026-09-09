@@ -1,6 +1,6 @@
 import { seedUsers } from './seeds/user.seed';
 import { seedTasks } from './seeds/task.seed';
-import { prisma } from '@prisma/client';
+import { prisma } from './../src/prisma/client';
 
 async function main() {
     const { admin, users } = await seedUsers();

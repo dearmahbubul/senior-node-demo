@@ -1,6 +1,6 @@
 import type { TaskStatus } from '../../src/generated/prisma/enums';
 
-import { prisma } from '@prisma/client';
+import { prisma } from '../../src/prisma/client';
 
 export async function makeTask(
     userId: string,

@@ -36,3 +36,10 @@ export async function publishToQueue(queueName: string, payload: unknown): Promi
     const message = Buffer.from(JSON.stringify(payload));
     ch.sendToQueue(queueName, message, { persistent: true });
 }
+
+export async function disconnectQueue(): Promise<void> {
+    if (!connection) return;
+    channel = null;
+    await connection.close();
+    connection = null;
+}
