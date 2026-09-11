@@ -2,30 +2,26 @@
 
 All endpoints are prefixed with `/api` and require JWT authentication.
 
+> **Model**: ClickUp-style. A **Project** (ClickUp List) owns **Stages** (ClickUp Statuses) directly — there is **no separate Pipeline entity**. Stages are ordered by `position` on the project.
+
 ## Project Management Context
 
 ### Projects
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects` | Create project (auto-creates pipeline with default stages) | `CreateProjectUseCase` |
+| POST | `/api/projects/blueprint` | Generate a project blueprint (name, description, stages) from a prompt — **AI, no writes, nothing persisted** | `GenerateProjectBlueprintUseCase` |
+| POST | `/api/projects` | Create project — optional `stages[]` (from blueprint/manual), else auto-creates default stages | `CreateProjectUseCase` |
 | GET | `/api/projects` | List user's projects | `ListProjectsUseCase` |
-| GET | `/api/projects/:id` | Get project detail with pipeline | `GetProjectUseCase` |
+| GET | `/api/projects/:id` | Get project detail with stages | `GetProjectUseCase` |
 | PATCH | `/api/projects/:id` | Update project name/description | `UpdateProjectUseCase` |
-| DELETE | `/api/projects/:id` | Delete project (cascades pipeline, stages, tasks) | `DeleteProjectUseCase` |
+| DELETE | `/api/projects/:id` | Delete project (cascades stages, tasks) | `DeleteProjectUseCase` |
 
-### Pipelines
-
-| Method | Endpoint | Description | Use Case |
-|--------|----------|-------------|----------|
-| GET | `/api/projects/:projectId/pipeline` | Get pipeline with all stages | `GetProjectUseCase` (includes pipeline) |
-| PATCH | `/api/projects/:projectId/pipeline` | Update pipeline settings | `UpdatePipelineUseCase` |
-
-### Stages
+### Stages (owned directly by a Project — no pipeline)
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects/:projectId/stages` | Add a new stage to pipeline | `AddStageUseCase` |
+| POST | `/api/projects/:projectId/stages` | Add a new stage to project | `AddStageUseCase` |
 | PATCH | `/api/projects/:projectId/stages/:id` | Update stage name/color | `UpdateStageUseCase` |
 | PATCH | `/api/projects/:projectId/stages/:id/reorder` | Reorder stage position | `ReorderStageUseCase` |
 | DELETE | `/api/projects/:projectId/stages/:id` | Delete stage (tasks become unstage) | `DeleteStageUseCase` |
@@ -102,15 +98,16 @@ All endpoints are prefixed with `/api` and require JWT authentication.
 
 ```typescript
 // src/routes/index.ts
-import projectRoutes from '@contexts/project-management/interfaces/project.routes';
-import taskRoutes from '@contexts/task-board/interfaces/task.routes';
-import reportRoutes from '@contexts/reports/interfaces/report.routes';
+import projectRoutes from '@modules/project-management/interfaces/http/project.routes';
+import taskRoutes from '@modules/task-board/interfaces/http/task.routes';
+import reportRoutes from '@modules/reports/interfaces/http/report.routes';
 
 const router = Router();
 router.use('/users', userRoutes);
 router.use('/auth', authRoutes);
 router.use('/projects', projectRoutes);
 router.use('/reports', reportRoutes);
+// Stages are nested under projects: /api/projects/:projectId/stages
 // Tasks are nested under projects: /api/projects/:projectId/tasks
 // Project reports: /api/projects/:projectId/reports/...
 ```

@@ -1,50 +1,131 @@
-# 03 - Module Architecture (DDD + SOLID)
+# 03 - Module Architecture (Modular Monolith + Clean/Hexagonal + DDD)
 
-## Why DDD Over Layered Modules?
+## The Architecture in One Sentence
 
-| Approach | Structure | Problem |
-|----------|-----------|---------|
-| **Layered Modules** (current) | `projects/`, `stages/`, `tasks/` each with controller/service/repository | Business logic leaks across modules. Moving a task requires touching task service + stage service + project service. |
-| **DDD Bounded Contexts** | `project-management/`, `task-board/` grouping related entities by domain | Business rules live together. A "task move" is one operation inside the task-board context. |
-
-**DDD wins here** because your domain has clear business boundaries — a Project owns a Pipeline, a Pipeline owns Stages, a Task moves through Stages. These are **aggregate boundaries**, not technical layers.
+A **Modular Monolith** with **Hexagonal (Ports & Adapters)** internals and **DDD** domain modelling — a single deployable process with strict internal boundaries.
 
 ---
 
-## DDD Building Blocks
+## Why This Combination?
 
-| Building Block | What It Is | Example in This System |
-|----------------|-----------|----------------------|
-| **Aggregate** | A cluster of entities treated as a single unit for data changes | `Project` aggregate (owns Pipeline, Stages, Tasks) |
-| **Aggregate Root** | The only entry point to modify an aggregate | `Project` (you can't modify a Stage without going through its Project) |
-| **Entity** | An object with identity that persists | `Task`, `TaskComment`, `User` |
-| **Value Object** | An immutable object without identity (describes something) | `TaskPriority`, `StageColor`, `Position` |
-| **Domain Event** | Something that happened in the domain | `TaskMoved`, `TaskAssigned`, `ProjectCreated` |
-| **Repository** | Abstracts persistence for an aggregate | `ProjectRepository`, `TaskRepository` |
-| **Domain Service** | Business logic that doesn't belong to a single entity | `TaskMoveService` (coordinates Stage + Task position changes) |
-| **Read Model** | A query-side projection optimized for reads/reporting | `DashboardReport`, `VelocityReport`, `TasksByStage` |
+| Term | What It Means Here |
+|------|-------------------|
+| **Modular Monolith** | One deployment unit, but each domain module is self-contained with its own internal layers. Modules communicate only through public contracts (ports), never by reaching into each other's internals. |
+| **Hexagonal (Ports & Adapters)** | The domain sits at the center. All I/O (database, HTTP, queues, workers) goes through **ports** (interfaces). Concrete implementations are **adapters** plugged in at the edges. |
+| **DDD** | Aggregates, entities, value objects, domain events model the business domain. Domain logic lives in entities, not services. |
+| **Clean Architecture** | Per-module layers (`domain` → `application` → `interfaces` → `infrastructure`) organize dependencies so they all **point inward**. Each module obeys the Dependency Rule; the outer layers are swappable frameworks.
+
+These three reinforce each other. The monolith gives you simplicity and transaction safety; hexagonal architecture keeps the edges swappable; DDD keeps the domain truthful.
 
 ---
 
-## Bounded Contexts
+## The Hexagon (Per Module)
+
+```
+                      ┌──────────────────────────────┐
+                      │        INTERFACES             │
+                      │   (Driving / Primary Adapters)│
+                      │                               │
+                      │  HTTP Controllers / Routes    │
+                      │  Queue Consumers              │
+                      │  CLI Commands                 │
+                      └──────────┬───────────────────┘
+                                 │ calls
+                      ┌──────────▼───────────────────┐
+                      │       APPLICATION             │
+                      │     (Use Cases / Commands)    │
+                      │                               │
+                      │  orchestrate domain + ports   │
+                      └──────────┬───────────────────┘
+                                 │ depends on
+                    ┌────────────▼────────────────────┐
+                    │           DOMAIN                │
+                    │       (Core Business Logic)     │
+                    │                                 │
+                    │  Entities / Value Objects        │
+                    │  Domain Events                  │
+                    │  PORTS (interfaces for I/O)     │
+                    └────────────┬────────────────────┘
+                                 │ implemented by
+                      ┌──────────▼───────────────────┐
+                      │      INFRASTRUCTURE           │
+                      │   (Driven / Secondary Adapters)│
+                      │                               │
+                      │  Prisma Repository impls      │
+                      │  RabbitMQ Event Publisher     │
+                      │  Redis Cache                  │
+                      │  Email Sender                 │
+                      │  S3 / Local File Storage      │
+                      └──────────────────────────────┘
+```
+
+**The Dependency Rule**: Arrows point inward only. Domain depends on nothing. Application depends on Domain. Infrastructure depends on Domain (implements its ports). Interfaces depends on Application.
+
+### Clean Architecture Layer Mapping (Per Module)
+
+Each module's folders map directly onto Clean Architecture's four layers. Dependencies point strictly inward, and this is enforced at **import level** (ESLint `import/no-restricted-paths` or the `boundaries` plugin can codify it):
+
+| Clean Architecture Layer | Folder | Contents | May Depend On |
+|--------------------------|--------|----------|---------------|
+| **Enterprise / Core Business Rules** | `domain/` | Entities, Value Objects, Domain Events, Ports (interfaces) | **Nothing** — pure TS, no Prisma, no Express |
+| **Application Business Rules** | `application/` | Use cases orchestrate domain objects + ports | `domain/` only |
+| **Interface Adapters** | `interfaces/` | Controllers, validators, resource/DTO mappers (driving adapters) | `application/` (+ `domain/` for DTO mapping) |
+| **Frameworks & Drivers** | `infrastructure/` | Prisma repositories, message-bus publishers, cross-module gateways (driven adapters) | `domain/` (implements its ports); never other modules' internals |
+
+Knock-on rules that keep the layers honest:
+
+1. **Domain never imports Prisma.** The Prisma `TaskPriority` enum is a persistence artifact. Domain defines its own `TaskPriority` union; repository adapters map between them (see the mapper in the adapter example below).
+2. **Application never imports Express, Prisma, or RabbitMQ.** It talks only to ports.
+3. **Infrastructure never imports another module's internals.** Cross-module reads go through **consumer-owned query ports** implemented as *gateways* in the consumer module (see "Cross-Module Communication Patterns").
+4. **`interfaces/` is the only place that sees HTTP.** Controllers map HTTP in/out to use-case inputs and DTOs; request validation lives in validators.
+5. **External AI/LLM providers are driven adapters, just like Prisma or RabbitMQ.** They implement a domain port (`ProjectBlueprintGeneratorPort`) in `infrastructure/ai/` via a shared `common/llm` client. Application never imports an OpenAI/Anthropic SDK — see `06-ai-project-blueprint.md`.
+
+---
+
+## Module Structure (Full File Tree)
 
 ```
 src/
-├── common/                        (shared infrastructure)
-│   ├── middleware/
-│   ├── errors/
-│   ├── events/
-│   └── ...
-├── contexts/
-│   ├── project-management/        ★ BOUNDED CONTEXT 1
-│   │   ├── domain/                — Entities, Value Objects, Aggregate Root
-│   │   │   ├── project.entity.ts
-│   │   │   ├── pipeline.entity.ts
-│   │   │   ├── stage.entity.ts
-│   │   │   ├── stage-color.value-object.ts
-│   │   │   └── stage-position.value-object.ts
-│   │   ├── application/           — Use cases (Application Services)
+├── common/                            SHARED INFRASTRUCTURE
+│   ├── middleware/                     — Express middleware (auth, validate, upload, rate-limit)
+│   ├── errors/                        — AppError, NotFoundError, ValidationError
+│   ├── events/                        — shared RabbitMQ message-bus adapter (implements each module's event-publisher PORT)
+│   ├── storage/                       — Storage port + S3/Local adapters (existing)
+│   ├── cache/                         — Cache port + Redis adapter
+│   ├── mail/                          — Email port + Nodemailer adapter (existing)
+│   ├── queue/                         — Queue port + RabbitMQ adapter (existing)
+│   ├── llm/                           — shared LLM client (provider interface + OpenAI adapter, used only by adapters)
+│   ├── types/                         — ApiResponse, shared DTOs
+│   ├── utils/                         — asyncHandler, prisma util
+│   ├── openapi/                       — Swagger/OpenAPI setup (existing)
+│   └── declarations/                  — Express type augmentation (existing)
+│
+├── modules/
+│   │
+│   ├── project-management/            MODULE 1: Projects + Stages
+│   │   │
+│   │   ├── domain/                    CORE — zero dependencies
+│   │   │   ├── entities/
+│   │   │   │   ├── project.entity.ts
+│   │   │   │   └── stage.entity.ts
+│   │   │   ├── value-objects/
+│   │   │   │   ├── stage-color.vo.ts
+│   │   │   │   ├── stage-position.vo.ts
+│   │   │   │   ├── stage-is-done.vo.ts
+│   │   │   │   ├── project-blueprint.vo.ts      (AI proposal — transient, never persisted)
+│   │   │   │   └── stage-draft.vo.ts
+│   │   │   ├── events/
+│   │   │   │   ├── project-created.event.ts
+│   │   │   │   └── stage-reordered.event.ts
+│   │   │   └── ports/                INTERFACES (no implementations here)
+│   │   │       ├── project.repository.port.ts
+│   │   │       ├── stage.repository.port.ts
+│   │   │       ├── project-event-publisher.port.ts
+│   │   │       └── project-blueprint-generator.port.ts
+│   │   │
+│   │   ├── application/              USE CASES — depends only on domain/
 │   │   │   ├── create-project.use-case.ts
+│   │   │   ├── generate-project-blueprint.use-case.ts   (AI — calls BlueprintGeneratorPort)
 │   │   │   ├── get-project.use-case.ts
 │   │   │   ├── list-projects.use-case.ts
 │   │   │   ├── update-project.use-case.ts
@@ -53,197 +134,196 @@ src/
 │   │   │   ├── update-stage.use-case.ts
 │   │   │   ├── reorder-stage.use-case.ts
 │   │   │   └── delete-stage.use-case.ts
-│   │   ├── infrastructure/        — Prisma implementation
-│   │   │   ├── prisma/
-│   │   │   │   └── project.repository.ts
-│   │   │   └── prisma/
-│   │   │       └── stage.repository.ts
-│   │   ├── interfaces/            — HTTP layer (Controller + Validator + Resource)
-│   │   │   ├── project.controller.ts
-│   │   │   ├── project.validator.ts
-│   │   │   ├── project.resource.ts
-│   │   │   └── project.routes.ts
-│   │   └── project-management.context.ts  — Wires everything together
+│   │   │
+│   │   ├── infrastructure/           ADAPTERS — implements domain ports
+│   │   │   ├── persistence/
+│   │   │   │   ├── prisma-project.repository.ts
+│   │   │   │   └── prisma-stage.repository.ts
+│   │   │   └── ai/
+│   │   │       └── openai-blueprint-generator.adapter.ts   (only file that knows the LLM)
+│   │   │
+│   │   ├── interfaces/               DRIVING ADAPTERS
+│   │   │   ├── http/
+│   │   │   │   ├── project.controller.ts
+│   │   │   │   ├── project.validator.ts
+│   │   │   │   ├── project.resource.ts
+│   │   │   │   └── project.routes.ts
+│   │   │   └── queue/
+│   │   │       └── stage-reordered.consumer.ts  (future)
+│   │   │
+│   │   ├── index.ts                  MODULE BARREL (public API)
+│   │   │   exports: { ProjectModule }
+│   │   │
+│   │   └── __tests__/                TESTS colocated with module
+│   │       ├── project.entity.test.ts
+│   │       ├── create-project.use-case.test.ts
+│   │       └── project.controller.test.ts
 │   │
-│   └── task-board/                ★ BOUNDED CONTEXT 2
-│       ├── domain/
-│       │   ├── task.entity.ts
-│       │   ├── task-assignment.entity.ts
-│       │   ├── task-comment.entity.ts
-│       │   ├── task-attachment.entity.ts
-│       │   ├── task-priority.value-object.ts
-│       │   ├── task-position.value-object.ts
-│       │   └── task.events.ts       — Domain events (TaskMoved, TaskAssigned)
-│       ├── application/
-│       │   ├── create-task.use-case.ts
-│       │   ├── get-task.use-case.ts
-│       │   ├── list-tasks.use-case.ts
-│       │   ├── update-task.use-case.ts
-│       │   ├── delete-task.use-case.ts
-│       │   ├── move-task.use-case.ts        — Coordinates Task + Stage position
-│       │   ├── reorder-task.use-case.ts
-│       │   ├── assign-task.use-case.ts
-│       │   ├── unassign-task.use-case.ts
-│       │   ├── add-comment.use-case.ts
-│       │   └── delete-comment.use-case.ts
-│       ├── infrastructure/
-│       │   ├── prisma/
-│       │   │   ├── task.repository.ts
-│       │   │   ├── task-assignment.repository.ts
-│       │   │   └── task-comment.repository.ts
-│       │   └── queue/
-│       │       └── task-event-publisher.ts
-│       ├── interfaces/
-│       │   ├── task.controller.ts
-│       │   ├── task.validator.ts
-│       │   ├── task.resource.ts
-│       │   └── task.routes.ts
-│       └── task-board.context.ts
+│   │
+│   ├── task-board/                   MODULE 2: Tasks, Assignments, Comments
+│   │   │
+│   │   ├── domain/
+│   │   │   ├── entities/
+│   │   │   │   ├── task.entity.ts
+│   │   │   │   ├── task-assignment.entity.ts
+│   │   │   │   ├── task-comment.entity.ts
+│   │   │   │   └── task-attachment.entity.ts
+│   │   │   ├── value-objects/
+│   │   │   │   ├── task-priority.vo.ts
+│   │   │   │   └── task-position.vo.ts
+│   │   │   ├── events/
+│   │   │   │   ├── task-moved.event.ts
+│   │   │   │   ├── task-assigned.event.ts
+│   │   │   │   └── task-completed.event.ts
+│   │   │   └── ports/
+│   │   │       ├── task.repository.port.ts
+│   │   │       ├── task-assignment.repository.port.ts
+│   │   │       ├── task-comment.repository.port.ts
+│   │   │       ├── task-event-publisher.port.ts
+│   │   │       ├── project-query.port.ts     (consumer-owned → implemented as a gateway)
+│   │   │       ├── stage-query.port.ts        (consumer-owned → implemented as a gateway)
+│   │   │       └── user-query.port.ts         (consumer-owned → implemented as a gateway)
+│   │   │
+│   │   ├── application/
+│   │   │   ├── create-task.use-case.ts
+│   │   │   ├── get-task.use-case.ts
+│   │   │   ├── list-tasks.use-case.ts
+│   │   │   ├── update-task.use-case.ts
+│   │   │   ├── delete-task.use-case.ts
+│   │   │   ├── move-task.use-case.ts
+│   │   │   ├── reorder-task.use-case.ts
+│   │   │   ├── assign-task.use-case.ts
+│   │   │   ├── unassign-task.use-case.ts
+│   │   │   ├── add-comment.use-case.ts
+│   │   │   └── delete-comment.use-case.ts
+│   │   │
+│   │   ├── infrastructure/
+│   │   │   ├── persistence/
+│   │   │   │   ├── prisma-task.repository.ts
+│   │   │   │   ├── prisma-task-assignment.repository.ts
+│   │   │   │   └── prisma-task-comment.repository.ts
+│   │   │   ├── events/
+│   │   │   │   └── task-event-publisher.adapter.ts
+│   │   │   └── gateways/            CROSS-MODULE adapters (consumer-owned)
+│   │   │       ├── project-query.gateway.ts    → project-management barrel
+│   │   │       ├── stage-query.gateway.ts       → project-management barrel
+│   │   │       └── user-query.gateway.ts        → auth barrel
+│   │   │
+│   │   ├── interfaces/
+│   │   │   ├── http/
+│   │   │   │   ├── task.controller.ts
+│   │   │   │   ├── task.validator.ts
+│   │   │   │   ├── task.resource.ts
+│   │   │   │   └── task.routes.ts
+│   │   │   └── queue/
+│   │   │       └── task-moved.consumer.ts  (future)
+│   │   │
+│   │   ├── index.ts
+│   │   └── __tests__/
+│   │
+│   │
+│   ├── reports/                      MODULE 3: Dashboard & Analytics (Read-only)
+│   │   │
+│   │   ├── domain/
+│   │   │   ├── read-models/
+│   │   │   │   ├── dashboard-summary.rm.ts
+│   │   │   │   ├── tasks-by-stage.rm.ts
+│   │   │   │   ├── tasks-by-priority.rm.ts
+│   │   │   │   ├── velocity.rm.ts
+│   │   │   │   ├── task-aging.rm.ts
+│   │   │   │   └── workload.rm.ts
+│   │   │   ├── value-objects/
+│   │   │   │   └── time-range.vo.ts
+│   │   │   └── ports/
+│   │   │       ├── report-query.port.ts
+│   │   │       └── project-query.port.ts     (consumer-owned → implemented as a gateway)
+│   │   │
+│   │   ├── application/
+│   │   │   ├── get-user-summary.use-case.ts
+│   │   │   ├── get-user-tasks-by-stage.use-case.ts
+│   │   │   ├── get-user-tasks-by-priority.use-case.ts
+│   │   │   ├── get-user-velocity.use-case.ts
+│   │   │   ├── get-user-overdue.use-case.ts
+│   │   │   ├── get-user-upcoming.use-case.ts
+│   │   │   ├── get-user-workload.use-case.ts
+│   │   │   ├── get-project-summary.use-case.ts
+│   │   │   ├── get-project-tasks-by-stage.use-case.ts
+│   │   │   ├── get-project-tasks-by-priority.use-case.ts
+│   │   │   ├── get-project-velocity.use-case.ts
+│   │   │   ├── get-project-aging.use-case.ts
+│   │   │   ├── get-project-workload.use-case.ts
+│   │   │   └── get-project-assignee-activity.use-case.ts
+│   │   │
+│   │   ├── infrastructure/
+│   │   │   ├── persistence/
+│   │   │   │   └── prisma-report-query.adapter.ts
+│   │   │   ├── cache/
+│   │   │   │   └── report-cache.adapter.ts
+│   │   │   └── gateways/
+│   │   │       └── project-query.gateway.ts  → project-management barrel
+│   │   │
+│   │   ├── interfaces/
+│   │   │   └── http/
+│   │   │       ├── report.controller.ts
+│   │   │       ├── report.validator.ts
+│   │   │       ├── report.resource.ts
+│   │   │       └── report.routes.ts
+│   │   │
+│   │   ├── index.ts
+│   │   └── __tests__/
+│   │
+│   │
+│   └── auth/                         MODULE 4: Auth (existing — refactor)
+│       ├── domain/                    (keep as-is or extract JWT util here)
+│       ├── application/               (login, register use cases)
+│       ├── infrastructure/            (JWT adapter, bcrypt adapter)
+│       ├── interfaces/                (auth.controller, auth.routes)
+│       └── index.ts
 │
-│   └── reports/                 ★ BOUNDED CONTEXT 3
-│       ├── domain/              — Read Models & Query contracts (no writes)
-│       │   ├── dashboard-report.read-model.ts
-│       │   ├── tasks-by-stage.read-model.ts
-│       │   ├── tasks-by-priority.read-model.ts
-│       │   ├── velocity.read-model.ts
-│       │   ├── task-aging.read-model.ts
-│       │   ├── workload.read-model.ts
-│       │   └── time-range.value-object.ts
-│       ├── application/         — Report/query use cases (read-only)
-│       │   ├── get-user-summary.use-case.ts
-│       │   ├── get-user-tasks-by-stage.use-case.ts
-│       │   ├── get-user-tasks-by-priority.use-case.ts
-│       │   ├── get-user-velocity.use-case.ts
-│       │   ├── get-user-overdue.use-case.ts
-│       │   ├── get-user-upcoming.use-case.ts
-│       │   ├── get-user-workload.use-case.ts
-│       │   ├── get-project-summary.use-case.ts
-│       │   ├── get-project-tasks-by-stage.use-case.ts
-│       │   ├── get-project-tasks-by-priority.use-case.ts
-│       │   ├── get-project-velocity.use-case.ts
-│       │   ├── get-project-aging.use-case.ts
-│       │   ├── get-project-workload.use-case.ts
-│       │   └── get-project-assignee-activity.use-case.ts
-│       ├── infrastructure/
-│       │   ├── prisma/
-│       │   │   ├── report.repository.ts        — SQL aggregations over Task/TaskAssignment
-│       │   │   └── report-projection.repository.ts — (optional) materialized snapshot reads
-│       │   └── cache/
-│       │       └── report-cache.service.ts     — Redis cache for expensive dashboard queries
-│       ├── interfaces/
-│       │   ├── report.controller.ts
-│       │   ├── report.validator.ts
-│       │   ├── report.resource.ts
-│       │   └── report.routes.ts
-│       └── reports.context.ts
+├── common/
+│   └── di/                           COMPOSITION ROOT (wires everything)
+│       ├── container.ts              — instantiate adapters, inject into use cases
+│       ├── modules.ts                — register module routes
+│       └── events.ts                 — wire event publishers to consumers
+│
+├── prisma/
+│   └── client.ts                     (existing)
+│
+└── app.ts                            (existing — updated to use module barrel)
 ```
 
 ---
 
-## Layer Responsibilities (DDD Style)
+## Ports & Adapters in Practice
 
-### domain/ — The Core (No Framework Dependencies)
+### Port (Interface in Domain Layer)
 
 ```typescript
-// domain/project.entity.ts
-export class Project {
-  constructor(
-    public readonly id: string,
-    public name: string,
-    public description: string | null,
-    public readonly ownerId: string,
-    public readonly pipeline: Pipeline,
-    public readonly createdAt: Date,
-  ) {}
-
-  // Business rules live HERE, not in a service
-  addStage(name: string, color?: string): Stage {
-    if (this.pipeline.stages.length >= 20) {
-      throw new AppError(400, 'Pipeline cannot exceed 20 stages', 'STAGE_LIMIT_REACHED');
-    }
-    return this.pipeline.addStage(name, color);
-  }
-
-  removeStage(stageId: string): void {
-    if (this.pipeline.stages.length <= 1) {
-      throw new AppError(400, 'Cannot delete the last stage', 'LAST_STAGE');
-    }
-    this.pipeline.removeStage(stageId);
-  }
+// modules/task-board/domain/ports/task.repository.port.ts
+export interface TaskRepositoryPort {
+  findById(id: string): Promise<Task | null>;
+  save(task: Task): Promise<void>;
+  delete(id: string): Promise<void>;
+  listByStage(projectId: string, stageId: string): Promise<Task[]>;
 }
 ```
 
 ```typescript
-// domain/task.entity.ts
-export class Task {
-  constructor(
-    public readonly id: string,
-    public title: string,
-    public description: string | null,
-    public readonly projectId: string,
-    public stageId: string | null,
-    public position: number,
-    public priority: TaskPriority,
-    public dueDate: Date | null,
-    public readonly creatorId: string,
-  ) {}
-
-  // Domain event raised when task moves
-  moveTo(targetStageId: string, targetPosition: number): TaskMovedEvent {
-    const fromStageId = this.stageId;
-    this.stageId = targetStageId;
-    this.position = targetPosition;
-
-    return new TaskMovedEvent({
-      taskId: this.id,
-      fromStageId,
-      toStageId: targetStageId,
-    });
-  }
+// modules/task-board/domain/ports/task-event-publisher.port.ts
+export interface TaskEventPublisherPort {
+  publish(event: DomainEvent): Promise<void>;
 }
 ```
 
-### application/ — Use Cases (Orchestration Only)
+### Adapter (Infrastructure Layer)
 
 ```typescript
-// application/move-task.use-case.ts
-export class MoveTaskUseCase {
-  constructor(
-    private taskRepo: TaskRepository,
-    private stageRepo: StageRepository,
-    private eventPublisher: TaskEventPublisher,
-  ) {}
-
-  async execute(input: MoveTaskInput): Promise<TaskResponse> {
-    // 1. Load aggregates
-    const task = await this.taskRepo.findById(input.taskId);
-    if (!task) throw new NotFoundError('Task not found', 'TASK_NOT_FOUND');
-
-    const targetStage = await this.stageRepo.findById(input.targetStageId);
-    if (!targetStage) throw new NotFoundError('Stage not found', 'STAGE_NOT_FOUND');
-
-    // 2. Execute domain logic (returns domain event)
-    const event = task.moveTo(input.targetStageId, input.targetPosition);
-
-    // 3. Persist
-    await this.taskRepo.save(task);
-
-    // 4. Publish event (notification, activity log, etc.)
-    await this.eventPublisher.publish(event);
-
-    return task;
-  }
-}
-```
-
-### infrastructure/ — Prisma Implementation
-
-```typescript
-// infrastructure/prisma/task.repository.ts
+// modules/task-board/infrastructure/persistence/prisma-task.repository.ts
 import { prisma } from '@db/client';
-import { Task } from '../domain/task.entity';
+import { Task } from '../../domain/entities/task.entity';
+import { TaskRepositoryPort } from '../../domain/ports/task.repository.port';
 
-export class PrismaTaskRepository implements TaskRepository {
+export class PrismaTaskRepository implements TaskRepositoryPort {
   async findById(id: string): Promise<Task | null> {
     const raw = await prisma.task.findUnique({ where: { id } });
     return raw ? this.toDomain(raw) : null;
@@ -256,166 +336,190 @@ export class PrismaTaskRepository implements TaskRepository {
     });
   }
 
-  // Maps Prisma row → Domain entity
+  async delete(id: string): Promise<void> {
+    await prisma.task.delete({ where: { id } });
+  }
+
+  async listByStage(projectId: string, stageId: string): Promise<Task[]> {
+    const raws = await prisma.task.findMany({
+      where: { projectId, stageId },
+      orderBy: { position: 'asc' },
+    });
+    return raws.map(this.toDomain);
+  }
+
+  // Domain owns its TaskPriority union — Prisma enums are mapped here, at the edges.
   private toDomain(raw: any): Task {
-    return new Task(raw.id, raw.title, raw.description, raw.projectId, ...);
+    return new Task(
+      raw.id, raw.title, raw.description, raw.projectId,
+      raw.stageId, raw.position,
+      mapPriorityToDomain(raw.priority), // Prisma enum → domain union
+      raw.dueDate, raw.creatorId,
+    );
+  }
+}
+
+// Prisma enums and record shapes must NEVER cross into domain/. Every adapter
+// maps raw → domain (toDomain) and domain → raw (toPersistence). The domain
+// defines its own union/enum types so it compiles without Prisma.
+```
+
+### Use Case (Application Layer) — depends only on Port
+
+```typescript
+// modules/task-board/application/move-task.use-case.ts
+import { TaskRepositoryPort } from '../domain/ports/task.repository.port';
+import { TaskEventPublisherPort } from '../domain/ports/task-event-publisher.port';
+
+export class MoveTaskUseCase {
+  constructor(
+    private readonly taskRepo: TaskRepositoryPort,           // injected via DI
+    private readonly eventPublisher: TaskEventPublisherPort, // injected via DI
+  ) {}
+
+  async execute(input: { taskId: string; targetStageId: string; targetPosition: number }) {
+    const task = await this.taskRepo.findById(input.taskId);
+    if (!task) throw new NotFoundError('Task not found', 'TASK_NOT_FOUND');
+
+    const event = task.moveTo(input.targetStageId, input.targetPosition);
+
+    await this.taskRepo.save(task);
+    await this.eventPublisher.publish(event);
+
+    return task;
   }
 }
 ```
 
-### interfaces/ — HTTP Layer (Thin)
+### Composition Root (Wiring)
 
 ```typescript
-// interfaces/task.controller.ts
-export const taskController = {
-  move: asyncHandler(async (req, res) => {
-    const result = await moveTaskUseCase.execute({
-      taskId: req.params.id,
-      targetStageId: req.body.targetStageId,
-      targetPosition: req.body.targetPosition,
-    });
+// src/common/di/container.ts
+import { PrismaTaskRepository } from '@modules/task-board/infrastructure/persistence/prisma-task.repository';
+import { RabbitMQTaskEventPublisher } from '@modules/task-board/infrastructure/events/task-event-publisher.adapter';
+import { MoveTaskUseCase } from '@modules/task-board/application/move-task.use-case';
 
-    res.status(200).json({
-      success: true,
-      message: 'Task moved successfully',
-      data: taskResource.detail(result),
-    });
-  }),
-};
+// Instantiate adapters (singletons)
+const taskRepo = new PrismaTaskRepository();
+const taskEventPublisher = new RabbitMQTaskEventPublisher();
+
+// Inject into use cases
+export const moveTaskUseCase = new MoveTaskUseCase(taskRepo, taskEventPublisher);
 ```
 
 ---
 
-## Aggregate Boundaries Diagram
+## Enforcing Module Boundaries
+
+In a Modular Monolith, the **dependency rule is enforced at import level**:
+
+| Rule | Enforcement |
+|------|-------------|
+| **Modules cannot import other modules' internals** | A `task-board` use case can never `import { prisma } from '@db/client'` directly — it uses `TaskRepositoryPort` |
+| **Modules cannot import other modules' infrastructure** | `task-board` cannot import `prisma-project.repository.ts` |
+| **Modules communicate only through ports and events** | If `task-board` needs project data, it defines a `ProjectQueryPort` in its domain, implemented as a **gateway** in `task-board/infrastructure/gateways/` that delegates to `project-management`'s barrel (one-way dependency — never cyclic) |
+| **Composition root is the only place that knows all adapters** | `container.ts` imports all adapters from all modules |
+
+### Cross-Module Communication Patterns
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                Project Management                    │
-│                                                     │
-│  Project (Aggregate Root)                           │
-│  ├── Pipeline (Value Object — owned by Project)     │
-│  │   └── Stage[] (Entities — ordered by position)   │
-│  └── Tasks[] (reference only — belongs to TaskBoard)│
-└─────────────────────────────────────────────────────┘
+┌─────────────────┐        Port (ProjectQueryPort)        ┌─────────────────────┐
+│   task-board     │ ───────────────────────────────────▶ │ project-management   │
+│   (use case)     │                                       │ (adapter implements) │
+└─────────────────┘                                        └─────────────────────┘
 
-┌─────────────────────────────────────────────────────┐
-│                    Task Board                        │
-│                                                     │
-│  Task (Aggregate Root)                              │
-│  ├── TaskAssignment[] (Entities)                    │
-│  ├── TaskComment[] (Entities)                       │
-│  └── TaskAttachment[] (Entities)                    │
-│                                                     │
-│  Note: Task references Stage by ID (not owned)      │
-│  Cross-aggregate consistency via Domain Events       │
-└─────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────┐
-│                 Reports & Analytics                  │
-│                                                     │
-│  (Read-Model / Query context — NO aggregate writes) │
-│                                                     │
-│  Reads from Task + TaskAssignment + Stage tables     │
-│  Builds projections:                                │
-│   - Distribution by stage / priority                │
-│   - Velocity & throughput over time                 │
-│   - Task aging & overdue trends                     │
-│   - Team workload by assignee                       │
-│                                                     │
-│  Optionally cached in Redis / snapshot table        │
-└─────────────────────────────────────────────────────┘
+┌─────────────────┐        Domain Event                   ┌─────────────────────┐
+│   task-board     │ ──────── RabbitMQ ──────────────────▶ │   reports           │
+│   (publisher)    │                                       │   (consumer)        │
+└─────────────────┘                                        └─────────────────────┘
 ```
 
----
-
-## Cross-Context Communication
-
-When a task moves between stages, the Task Board context publishes a `TaskMovedEvent`. The Project Management context consumes it to update activity logs or trigger notifications.
+For **synchronous** cross-module reads (e.g., task-board needs to check "does this stage exist?"):
+- Define the port in the **consumer** module's `domain/ports/` (e.g., `StageQueryPort` in `task-board`)
+- Implement it as a **gateway** in the *same* module's `infrastructure/gateways/` that delegates to the provider module's **public barrel** (`project-management/index.ts`)
+- Wire it in the composition root
 
 ```typescript
-// Domain Event (shared contract)
-interface TaskMovedEvent {
-  taskId: string;
-  taskTitle: string;
-  projectId: string;
-  fromStageId: string | null;
-  toStageId: string;
-  movedById: string;
-  occurredAt: Date;
+// task-board/domain/ports/stage-query.port.ts
+export interface StageQueryPort {
+  existsById(stageId: string, projectId: string): Promise<boolean>;
+  findById(stageId: string): Promise<StageReadModel | null>;
 }
-
-// Published via RabbitMQ (existing infrastructure)
-// Consumed by notification worker + Reports projection updater
 ```
-
----
-
-## Reports Context — Caching & Performance
-
-Dashboards aggregate data across many tasks. To keep them fast without hammering the main task tables:
-
-| Strategy | When To Use | Mechanism |
-|----------|-------------|-----------|
-| **Direct SQL `GROUP BY`** | Small-to-medium datasets (default) | Prisma query / raw `pg` aggregate queries |
-| **Redis Cache** | Frequently-hit dashboards with stable ranges | Cache JSON report by `(userId, projectId, range, filters)` with TTL (e.g. 5 min) |
-| **Materialized Snapshot Table** | Large datasets / heavy velocity queries | Worker refreshes `TaskSnapshot` from `TaskMoved`/`TaskCompleted` events |
-
-**Cache-aside pattern** (in `report-cache.service.ts`):
-```
-1. Check Redis for key = report:user:{id}:summary:week
-2. On hit → return cached JSON
-3. On miss  → run aggregation SQL, store in Redis, return
-4. Invalidate on TaskMoved/TaskCompleted events (or rely on TTL)
-```
-
-> The Reports context stays **read-only**. It never issues write commands to the task/project aggregates — it only reads source tables and maintains its own derived projections.
-
-
-
-| Principle | DDD Implementation |
-|-----------|-------------------|
-| **S**ingle Responsibility | Each Use Case does ONE thing. `MoveTaskUseCase` only moves tasks. |
-| **O**pen/Closed | New use cases (e.g., `BulkMoveTaskUseCase`) extend without modifying existing ones. |
-| **L**iskov Substitution | `TaskRepository` interface — swap `PrismaTaskRepository` for `InMemoryTaskRepository` in tests. |
-| **I**nterface Segregation | Use Cases depend only on the repository methods they need, not the full repository. |
-| **D**ependency Inversion | Use Cases depend on repository interfaces, not Prisma. Infrastructure implements the interfaces. |
-
----
-
-## File Count Comparison
-
-| Approach | New Files | Modified Files |
-|----------|-----------|---------------|
-| Layered Modules | 18 | 9 |
-| **DDD Bounded Contexts** | **22** | **5** |
-
-DDD creates more files but **fewer modifications to existing code** — the bounded contexts encapsulate changes cleanly.
-
----
-
-## Validation & Resources (Kept in interfaces/)
-
-Zod validators and response transformers stay in the `interfaces/` layer — they're HTTP-specific, not domain logic.
 
 ```typescript
-// interfaces/project.validator.ts (unchanged from previous plan)
-createProjectSchema = z.object({
-  body: z.object({
-    name: z.string().min(1).max(100),
-    description: z.string().max(2000).optional(),
-  }),
-});
+// task-board/infrastructure/gateways/stage-query.gateway.ts
+// Consumer-owned adapter: implements StageQueryPort by calling project-management's public API.
+import { projectManagement } from '@modules/project-management';
+
+export class StageQueryGateway implements StageQueryPort {
+  async existsById(stageId: string, projectId: string): Promise<boolean> {
+    return projectManagement.stageQueries.existsById(stageId, projectId);
+  }
+}
 ```
+
+The gateway keeps the module dependency **one-way** (`task-board` → `project-management`). Never place the gateway in the provider module — the provider would then import the consumer's port type, and the module dependency graph could become cyclic.
+
+For **asynchronous** cross-module communication:
+- Use domain events via RabbitMQ (existing infrastructure)
+
+---
+
+## Module Public API (Barrel Exports)
+
+Each module exposes only what other modules (or the main app) can use. Nothing else is accessible.
+
+```typescript
+// modules/project-management/index.ts
+export { projectModuleRoutes } from './interfaces/http/project.routes';
+export { ProjectModule } from './project-management.module';
+```
+
+```typescript
+// modules/task-board/index.ts
+export { taskModuleRoutes } from './interfaces/http/task.routes';
+export { TaskModule } from './task-board.module';
+```
+
+> **Cross-module access rule**: module A may **only** import `@modules/b` (its barrel `index.ts`). Barrels export routes, the module class, and the *public query facades* that other modules' gateways call. A consumer's gateway never imports `b/infrastructure/...` or `b/domain/...` directly — only the provider's barrel.
+
+---
+
+## SOLID in This Architecture
+
+| Principle | Implementation |
+|-----------|---------------|
+| **S**ingle Responsibility | Each Use Case does ONE thing. Each module owns ONE domain concept. |
+| **O**pen/Closed | New use cases or adapters extend without modifying existing code. Add a new adapter = new class implementing an existing port. |
+| **L**iskov Substitution | `TaskRepositoryPort` can be swapped: `PrismaTaskRepository` in prod, `InMemoryTaskRepository` in tests. |
+| **I**nterface Segregation | Ports are narrow. `TaskRepositoryPort` has only the methods the task-board module needs. |
+| **D**ependency Inversion | Domain defines ports. Infrastructure implements them. Use cases depend on ports, never on concrete classes. |
 
 ---
 
 ## Migration Path (From Current Codebase)
 
-1. Create `src/contexts/` directory structure
-2. Move existing `src/modules/projects/` → `src/contexts/project-management/`
-3. Move existing `src/modules/tasks/` → `src/contexts/task-board/`
-4. Extract domain entities from service/repository files
-5. Create Use Case files from service methods
-6. Implement repository interfaces in infrastructure/
-7. Update controllers to call Use Cases instead of services
-8. Update route registration
+1. Create `src/modules/` directory structure
+2. Move `src/modules/tasks/` → `src/modules/task-board/` with new internal layers
+3. Extract `TaskRepositoryPort` from existing `task.repository.ts`
+4. Move existing repository to `infrastructure/persistence/`
+5. Create `src/common/di/container.ts` (composition root)
+6. Move `src/modules/projects/` → `src/modules/project-management/`
+7. Create new `src/modules/reports/` module
+8. Refactor controllers to call use cases from the composition root
+9. Update `src/app.ts` and `src/routes/index.ts` to use module barrel exports
+
+---
+
+## File Count vs. Previous Plan
+
+| Layer | Files |
+|-------|-------|
+| domain/ (entities, VOs, events, ports) | ~21 |
+| application/ (use cases) | ~21 |
+| infrastructure/ (adapters + cross-module gateways) | ~14 |
+| interfaces/ (HTTP + queue consumers) | ~12 |
+| di/ (composition root) | 3 |
+| __tests__/ | colocated |
+| **Total new files** | **~71** |

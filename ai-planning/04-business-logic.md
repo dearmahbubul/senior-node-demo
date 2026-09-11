@@ -1,35 +1,58 @@
 # 04 - Core Business Logic (DDD Use Cases)
 
+> **Cross-module reads** (project exists, stage belongs to project, users exist) are expressed as **query ports owned by the calling module** — `ProjectQueryPort`, `StageQueryPort`, `UserQueryPort` — and implemented as gateways in `infrastructure/gateways/`. Use cases depend only on those ports, never on another module's internals. SQL/Prisma snippets below are **adapter implementations** of the relevant ports; the use case itself never sees the SQL.
+
 ## Use Case: Create Project
 
 ```
-CreateProjectUseCase.execute(input)
+CreateProjectUseCase.execute({ ownerId, name, description?, stages?: StageDraft[] })
 
-  1. Create Project aggregate root
-  2. Create Pipeline (value object) attached to Project
-  3. Create 5 default Stages: ["Backlog", "To Do", "In Progress", "In Review", "Done"]
-  4. Persist via ProjectRepository
-  5. Raise ProjectCreatedEvent
-  6. Return Project aggregate with Pipeline
+  1. If stages omitted → 5 default Stages: ["Backlog", "To Do", "In Progress", "In Review", "Done"]
+       — mark the last stage isDone = true
+  2. Project.create(ownerId, name, description, stages)
+       — same invariants as manual stage management: max 20, unique names,
+         gap-free positions, exactly one terminal isDone stage
+  3. Persist via ProjectRepository
+  4. Raise ProjectCreatedEvent
+  5. Return Project aggregate with Stages
 ```
 
 **Boundary**: Project Management Context
 
-## Use Case: Add Stage to Pipeline
+## Use Case: Generate Project Blueprint (AI-Assisted Setup)
+
+```
+GenerateProjectBlueprintUseCase.execute({ userId, prompt, projectType? })
+
+  1. Validate input: prompt non-empty, ≤ 2000 chars
+  2. Call ProjectBlueprintGeneratorPort.generate({ prompt, projectType })
+       — adapter talks to the LLM (see 06-ai-project-blueprint.md)
+  3. If result is null OR fails Project.create() invariants:
+       → fall back to the default 5-stage blueprint
+  4. Return ProjectBlueprint { name, description?, stages[] }
+       — nothing is persisted; the blueprint is a transient proposal
+```
+
+**Boundary**: Project Management Context. The AI is behind `ProjectBlueprintGeneratorPort` (domain port) implemented in `infrastructure/ai/` — domain/application have no LLM SDK dependency. The blueprint itself is a **Value Object**, never an aggregate or a table.
+
+> **Create-from-blueprint**: the client confirms/edits the blueprint, then posts it to `CreateProjectUseCase` (`POST /api/projects`), which accepts an optional `stages[]`. There is no separate "blueprint" entity to persist.
+
+## Use Case: Add Stage to Project
 
 ```
 AddStageUseCase.execute(projectId, input)
 
-  1. Load Project aggregate (includes Pipeline)
+  1. Load Project aggregate
   2. Project.addStage(name, color) — business rule: max 20 stages
   3. Persist via ProjectRepository
-  4. Return updated Pipeline with new Stage
+  4. Return updated Project with new Stage
 ```
 
 **Business Rules** (in Project entity):
-- Maximum 20 stages per pipeline
+- Maximum 20 stages per project
 - Stage position is auto-assigned (gap-free)
-- Stage name must be unique within pipeline
+- Stage name must be unique within project
+- Exactly one stage should be marked `isDone` (the terminal column)
 
 ## Use Case: Reorder Stage
 
@@ -37,10 +60,10 @@ AddStageUseCase.execute(projectId, input)
 ReorderStageUseCase.execute(projectId, stageId, newPosition)
 
   1. Load Project aggregate
-  2. Pipeline.reorderStage(stageId, newPosition) — shifts positions
+  2. Project.reorderStage(stageId, newPosition) — shifts positions
   3. Persist via ProjectRepository
   4. Raise StageReorderedEvent
-  5. Return updated Pipeline
+  5. Return updated Project
 ```
 
 ## Use Case: Create Task
@@ -48,8 +71,8 @@ ReorderStageUseCase.execute(projectId, stageId, newPosition)
 ```
 CreateTaskUseCase.execute(projectId, input)
 
-  1. Validate Project exists (cross-aggregate reference)
-  2. Validate Stage exists (if stageId provided)
+  1. Validate Project exists (cross-module read → ProjectQueryPort)
+  2. Validate Stage exists (if stageId provided → StageQueryPort)
   3. Create Task aggregate root
   4. If assigneeIds provided: create TaskAssignment entities
   5. Persist via TaskRepository
@@ -65,7 +88,7 @@ CreateTaskUseCase.execute(projectId, input)
 MoveTaskUseCase.execute(input: { taskId, targetStageId, targetPosition })
 
   1. Load Task aggregate
-  2. Validate target Stage belongs to same Pipeline (cross-aggregate check)
+  2. Validate target Stage belongs to the same Project (cross-module read → StageQueryPort)
   3. Task.moveTo(targetStageId, targetPosition) — returns TaskMovedEvent
   4. Persist via TaskRepository (atomic position shift)
   5. Publish TaskMovedEvent via RabbitMQ
@@ -93,12 +116,14 @@ moveTo(targetStageId: string, targetPosition: number): TaskMovedEvent {
 
 **Infrastructure** (in TaskRepository):
 ```typescript
-// Atomic position shift within a stage
+// Atomic position shift within a stage (a persistence-transactional concern)
 async shiftPositions(stageId: string, fromPosition: number, toPosition: number) {
   // Decrement positions after old position in source stage
   // Increment positions at/beyond target position in target stage
 }
 ```
+
+> Position renumbering is a **persistence-adapter** concern (atomic DB transaction). The ordering *invariant* (no gaps, valid target/target-stage) is owned by the Task aggregate + application validation; the repository adapter implements the physical shift via the `TaskRepositoryPort`. The use case never sees SQL.
 
 ## Use Case: Reorder Task Within Stage
 
@@ -118,7 +143,7 @@ ReorderTaskUseCase.execute(taskId, newPosition)
 AssignTaskUseCase.execute(taskId, userIds[])
 
   1. Load Task aggregate
-  2. Validate Users exist (cross-aggregate)
+  2. Validate Users exist (cross-module read → UserQueryPort)
   3. Create TaskAssignment entities (within Task aggregate)
   4. Persist via TaskRepository
   5. Raise TaskAssignedEvent for each new assignment
@@ -154,7 +179,7 @@ Tasks support priority levels (`LOW`, `MEDIUM`, `HIGH`, `URGENT`) and can be fil
 ```
 GetProjectSummaryUseCase.execute(projectId, range)
 
-  1. Load project (verify ownership)
+  1. Load project (verify ownership → ProjectQueryPort)
   2. Aggregate tasks:
        total          = COUNT(tasks)
        done           = COUNT(tasks where stage is terminal / completedAt set)
@@ -173,7 +198,7 @@ GetProjectTasksByStageUseCase.execute(projectId)
   SELECT stage.name, stage.position, COUNT(task.id) as count
   FROM stage
   LEFT JOIN task ON task.stage_id = stage.id
-  WHERE stage.pipeline.project_id = :projectId
+  WHERE stage.project_id = :projectId
   GROUP BY stage.id, stage.name, stage.position
   ORDER BY stage.position
 ```
@@ -275,6 +300,6 @@ GetUserDashboardSummaryUseCase.execute(userId)
 
 - All endpoints require JWT authentication (`authenticate` middleware)
 - Project access: only owner can modify (add `authorizeProject` middleware)
-- Task move: validate stage belongs to same pipeline
+- Task move: validate stage belongs to same project
 - Stage delete: validate not the last stage (min 1 required)
 - Rate limiting: reuse existing `rateLimiter` middleware

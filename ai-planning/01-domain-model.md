@@ -5,15 +5,27 @@
 A multi-tenant task management system where:
 
 - Each **User** owns one or more **Projects**
-- Each **Project** has a configurable **Pipeline** (ordered list of **Stages**)
+- Each **Project** has an ordered list of **Stages** (columns) — ClickUp-style, no separate Pipeline entity
 - **Tasks** live inside a Stage and can be dragged/reordered/moved between Stages
 - Everything is exposed as REST APIs with full CRUD + drag-and-drop support
+
+## What "Workflow" Means Here (ClickUp Mapping)
+
+ClickUp uses the term **"Workflow"** to mean *the collection of Statuses a task can be in* — **not** a separate database entity. There is no `Workflow` table. The workflow is simply the ordered set of Statuses/columns configured on a List.
+
+| ClickUp | Our Plan |
+|---------|----------|
+| List | `Project` |
+| Status (the column on the board) | `Stage` |
+| "Workflow" (the ordered collection of statuses) | The ordered `Stage[]` owned by the `Project` — **no separate table** |
+
+> **Consequence**: In our plan, `Stage` plays the role of both the *column* and the *task's status*. When someone says "build a workflow," it means **adding/reordering `Stage`s on a `Project`** — covered by the `AddStageUseCase` and `ReorderStageUseCase`. There is deliberately **no `Workflow`/`Pipeline` entity** (ClickUp-style), keeping the model simple.
 
 ## Bounded Contexts
 
 | Context | Responsibility | Aggregates |
 |---------|---------------|------------|
-| **Project Management** | Project lifecycle, Pipeline configuration, Stage management | `Project` (root), `Pipeline`, `Stage` |
+| **Project Management** | Project lifecycle, Stage (column) management | `Project` (root), `Stage` |
 | **Task Board** | Task lifecycle, Assignments, Comments, Attachments | `Task` (root), `TaskAssignment`, `TaskComment`, `TaskAttachment` |
 | **Reports & Analytics** | User/project dashboards, metrics, charts over task/stage movement | `DashboardReport` (query model, read-only) |
 | **User Management** | Authentication, User profiles | `User` (existing) |
@@ -24,10 +36,13 @@ A multi-tenant task management system where:
 ┌─────────────────────────────────────────────────────┐
 │                Project Management                    │
 │                                                     │
-│  Project (Aggregate Root)                           │
-│  ├── Pipeline (Value Object — owned by Project)     │
-│  │   └── Stage[] (Entities — ordered by position)   │
+│  Project (Aggregate Root)  [ClickUp "List"]         │
+│  ├── Stage[] (Entities — ordered by position)       │
+│  │       [ClickUp "Status"/column]                  │
 │  └── Tasks[] (reference only — belongs to TaskBoard)│
+│                                                     │
+│  NOTE: No separate Pipeline entity. Stages belong   │
+│  directly to the Project (ClickUp-style).           │
 └─────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────┐
@@ -61,8 +76,7 @@ A multi-tenant task management system where:
 
 ```
 User 1──N Project
-Project 1──1 Pipeline
-Pipeline 1──N Stage (ordered by position)
+Project 1──N Stage (ordered by position)
 Project 1──N Task (pinned to a stage)
 Stage 1──N Task
 Task N──N User (via TaskAssignment for multi-assignee)
@@ -75,8 +89,7 @@ Task 1──N TaskComment
 | Relation | Type | Notes |
 |----------|------|-------|
 | User → Project | 1:N | Creator / owner |
-| Project → Pipeline | 1:1 | One pipeline per project, auto-created on project init |
-| Pipeline → Stage | 1:N | Ordered by `position` (integer, gap-free) |
+| Project → Stage | 1:N | Stages (columns) owned directly by the project — no pipeline (ClickUp-style) |
 | Project → Task | 1:N | Tasks belong to a project (cross-aggregate reference) |
 | Stage → Task | 1:N | Tasks are pinned to a stage (cross-aggregate reference) |
 | Task → TaskAssignment | 1:N | Multi-assignee support (within Task aggregate) |
@@ -89,11 +102,12 @@ Task 1──N TaskComment
 
 | Type | Name | Description |
 |------|------|-------------|
-| **Aggregate Root** | `Project` | Owns the Pipeline and Stage ordering |
-| **Entity** | `Stage` | A column in the Kanban board (has identity, ordered) |
-| **Value Object** | `Pipeline` | Container for ordered Stages (no separate identity) |
+| **Aggregate Root** | `Project` | Owns Stage ordering (ClickUp List) |
+| **Entity** | `Stage` | A column/status in the Kanban board (has identity, ordered) |
 | **Value Object** | `StageColor` | Hex color for stage header (immutable) |
-| **Value Object** | `StagePosition` | Ordered integer position (immutable, validates gap-free) |
+| **Value Object** | `StagePosition` | Ordered integer position (immutable wrapper). Gap-free sequencing is an **aggregate invariant** enforced by `Project.addStage()` / `Project.reorderStage()` — not by the VO itself |
+| **Value Object** | `ProjectBlueprint` | AI/multi-step proposal: `{ name, description?, stages: StageDraft[] }`. **Transient** — never persisted; only the resulting `Project` + `Stage[]` are saved |
+| **Value Object** | `StageDraft` | A single proposed column from a blueprint: `{ name, color?, isDone? }` |
 
 ### Task Board Context
 
@@ -122,13 +136,19 @@ Task 1──N TaskComment
 
 | Event | Source Context | Consumer | Trigger |
 |-------|---------------|----------|---------|
-| `ProjectCreated` | Project Management | Reports | New project initialized with pipeline + default stages |
+| `ProjectCreated` | Project Management | Reports | New project initialized with default stages |
 | `TaskMoved` | Task Board | Reports, Notifications | Task moved between stages |
 | `TaskAssigned` | Task Board | Notifications | User assigned to task |
-| `StageReordered` | Project Management | Task Board | Pipeline stages reordered |
+| `StageReordered` | Project Management | Task Board | Project stages reordered |
 | `TaskCompleted` | Task Board | Reports | Task reaches a terminal "Done" stage |
 
 > **Note**: Reports is primarily a **query/read-model context**. It doesn't own entities or write commands. It builds projections by consuming domain events from Task Board and Project Management, or by querying task tables directly with read-only SQL.
+
+## AI-Assisted Project Setup (Blueprint)
+
+When a user wants a project fully set up for tasks without manually configuring columns, an **AI** generates a `ProjectBlueprint` — project name, description, and an ordered list of `StageDraft[]` (the workflow). See [06-ai-project-blueprint.md](06-ai-project-blueprint.md).
+
+**Architectural note**: AI is an **external technology**, not a new bounded context. It sits behind the `ProjectBlueprintGeneratorPort` (in `project-management/domain/ports/`), implemented by an OpenAI/LLM adapter in `project-management/infrastructure/ai/`. The blueprint is a **transient value object** — nothing is persisted until the user confirms via `CreateProjectUseCase`, which validates the stages against the exact same `Project` invariants as manual stage management.
 
 ## Prisma Changes for Reports
 
@@ -172,7 +192,7 @@ model Project {
   description String?  @db.Text
   ownerId     String
   owner       User     @relation("ProjectOwner", fields: [ownerId], references: [id])
-  pipeline    Pipeline?
+  stages      Stage[]
   tasks       Task[]
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -180,26 +200,22 @@ model Project {
   @@index([ownerId])
 }
 
-model Pipeline {
-  id        String  @id @default(uuid())
-  projectId String  @unique
-  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  stages    Stage[]
-}
-
 model Stage {
-  id         String  @id @default(uuid())
-  pipelineId String
-  pipeline   Pipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
-  name       String
-  position   Int
-  color      String? @default("#6366f1")
-  tasks      Task[]
+  id        String  @id @default(uuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name      String
+  position  Int
+  color     String? @default("#6366f1")
+  isDone    Boolean @default(false)
+  tasks     Task[]
 
-  @@unique([pipelineId, position])
-  @@index([pipelineId])
+  @@unique([projectId, position])
+  @@index([projectId])
 }
 ```
+
+> **Note**: `Stage` now belongs directly to `Project` (ClickUp-style, no `Pipeline` entity). `isDone` marks the terminal "Done" stage used by completion-rate and velocity reports.
 
 ### Task Board Context
 
@@ -261,6 +277,8 @@ enum TaskPriority {
 }
 ```
 
+> **Prisma enums are a persistence concern.** The domain layer defines its own `TaskPriority` union type (mirroring the enum) and **never imports Prisma types**. Repository adapters map Prisma enum → domain union in `toDomain()` and reverse in `toPersistence()`. This keeps the core (`domain/` + `application/`) framework-free, so the domain still compiles if the DB technology changes.
+
 ### Existing Models to Update
 
 - **User**: add `projects Project[]`, `assignments TaskAssignment[]`, `comments TaskComment[]`
@@ -271,8 +289,8 @@ enum TaskPriority {
 
 ## Migration Strategy
 
-1. Create new models (`Project`, `Pipeline`, `Stage`, `TaskAssignment`, `TaskComment`)
+1. Create new models (`Project`, `Stage`, `TaskAssignment`, `TaskComment`)
 2. Rename old `Task` → `LegacyTask` temporarily
 3. Create new `Task` model
-4. Migrate data from `LegacyTask` → `Task` (with project assignment logic)
+4. Migrate data from `LegacyTask` → `Task` (map old `TaskStatus` enum to default project stages)
 5. Drop `LegacyTask` and old `TaskStatus` enum
