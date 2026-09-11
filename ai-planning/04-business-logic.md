@@ -1,15 +1,108 @@
 # 04 - Core Business Logic (DDD Use Cases)
 
-> **Cross-module reads** (project exists, stage belongs to project, users exist) are expressed as **query ports owned by the calling module** — `ProjectQueryPort`, `StageQueryPort`, `UserQueryPort` — and implemented as gateways in `infrastructure/gateways/`. Use cases depend only on those ports, never on another module's internals. SQL/Prisma snippets below are **adapter implementations** of the relevant ports; the use case itself never sees the SQL.
+> **Cross-module reads** (organization exists, membership/role, project exists, stage belongs to project, users exist) are expressed as **query ports owned by the calling module** — `OrganizationQueryPort`, `MembershipQueryPort`, `ProjectQueryPort`, `StageQueryPort`, `UserQueryPort` — and implemented as gateways in `infrastructure/gateways/`. Use cases depend only on those ports, never on another module's internals. SQL/Prisma snippets below are **adapter implementations** of the relevant ports; the use case itself never sees the SQL.
+
+> **Tenancy**: every write use case receives `{ orgId, actorId }`. `actorId` comes from the JWT; `orgId` comes **only from the URL**, never the body. The interface layer applies `authorizeMembership({ orgId, minRole })`; use cases additionally re-validate via `MembershipQueryPort`. `VIEWER` role is read-only — tenant write use cases reject it.
+
+## Tenancy Use Cases (Organization Management Context)
+
+### Use Case: Create Organization
+
+```
+CreateOrganizationUseCase.execute({ actorId, name, slug })
+
+  1. Validate slug is unique (OrganizationRepository.findBySlug)
+  2. Normalize + reserve the default subdomain (= slug, Subdomain VO rules:
+       lowercase [a-z0-9-], 3–63 chars, not in reserved list); append "-<rand>"
+       on collision (OrganizationRepository.findBySubdomain)
+  3. Organization.create({ name, slug, ownerId: actorId, subdomain })
+     + generate DomainVerificationToken (unused until custom domain requested)
+  4. Persist Organization
+  5. Create OrganizationMembership(actorId, role=OWNER)
+  6. Raise OrganizationCreatedEvent
+  7. Return Organization (with tenantUrl = https://{subdomain}.{APP_BASE_HOST})
+```
+
+> On user signup the Auth module calls this internally to auto-provision the user's **personal organization** (`OrganizationCreatedEvent`).
+
+### Use Case: Manage Tenant Domain
+
+> Behavior: **every organization gets a default subdomain at creation**; an OWNER/ADMIN can later customize it or add a **custom domain** that only becomes active after DNS verification. The subdomain/custom domain are the values `resolveTenant` matches on the `Host` header.
+
+```
+UpdateSubdomainUseCase.execute({ orgId, actorId, subdomain })
+  0. Require role ≥ ADMIN (MembershipQueryPort — reject VIEWER)
+  1. Validate Subdomain VO rules + reserved names; OrganizationRepository.findBySubdomain → 409 if taken
+  2. Organization.updateSubdomain(subdomain)
+  3. Persist; raise SubdomainChangedEvent (triggers URL re-linking / CDN invalidation)
+
+RequestCustomDomainUseCase.execute({ orgId, actorId, domain })
+  0. Require role ≥ ADMIN
+  1. Validate CustomDomain VO (valid FQDN, not equal to a base host/wildcard, not already in use:
+       OrganizationRepository.findByCustomDomain → 409)
+  2. Generate a fresh DomainVerificationToken, e.g. 32-hex
+  3. DomainVerificationPort.getTxtRecord(domain) → returns the exact TXT record to publish:
+       record name  _taskflow-verification.<domain>
+       record value  <token>
+  4. Persist { customDomain, customDomainVerificationToken } — customDomainVerifiedAt stays null
+  5. Return instructions (DNS record + note DNS can take minutes to propagate)
+
+VerifyCustomDomainUseCase.execute({ orgId, actorId })
+  0. Require role ≥ ADMIN
+  1. Load Organization; if no pending customDomain → 404
+  2. DomainVerificationPort.checkTxtRecord(domain, token)
+       — queries DNS for TXT under _taskflow-verification.<domain>
+       — matches ANY record containing the token (case-insensitive)
+  3. Match → set customDomainVerifiedAt = now; raise CustomDomainVerifiedEvent; return tenantUrl
+     No match → 409 "DNS record not found or not propagated yet"
+  4. customDomain overrides the subdomain in resolveTenant from now on
+
+RemoveCustomDomainUseCase.execute({ orgId, actorId })
+  0. Require role ≥ ADMIN
+  1. Clear customDomain* fields; raise CustomDomainRemovedEvent
+  2. Tenant reverts to https://{subdomain}.{APP_BASE_HOST}
+```
+
+> **DnsVerificationPort** (`organization-management/domain/ports/`) is a normal driven port like a repository: the use case never talks to DNS directly. The adapter (`infrastructure/verification/dns-verification.adapter.ts`) implements it via Node's `dns/promises` (TXT lookup) — no external dependency required for DNS readback; an optional provider adapter (Route53/Cloudflare) can be swapped in later to also *create* records automatically.
+
+### Use Case: Add Member
+
+```
+AddMemberUseCase.execute({ orgId, actorId, userId, role })
+
+  1. Verify actor membership + role ≥ ADMIN (MembershipQueryPort via middleware + use case)
+  2. Load Organization aggregate
+  3. Organization.addMember(userId, role) — unique (orgId, userId)
+  4. Persist OrganizationMembership
+  5. Raise MemberAddedEvent
+  6. Return membership
+```
+
+### Use Case: List Members
+
+```
+ListMembersUseCase.execute({ orgId, actorId })
+  → OrganizationMembership[] (any member may list)
+```
+
+### Use Case: Update Member Role / Remove Member
+
+```
+UpdateMemberRoleUseCase.execute({ orgId, actorId, userId, newRole })
+  → requires actor role OWNER/ADMIN; cannot demote/remove the OWNER
+RemoveMemberUseCase.execute({ orgId, actorId, userId })
+  → requires OWNER (or self); last OWNER cannot be removed
+```
 
 ## Use Case: Create Project
 
 ```
-CreateProjectUseCase.execute({ ownerId, name, description?, stages?: StageDraft[] })
+CreateProjectUseCase.execute({ orgId, actorId, name, description?, stages?: StageDraft[] })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. If stages omitted → 5 default Stages: ["Backlog", "To Do", "In Progress", "In Review", "Done"]
        — mark the last stage isDone = true
-  2. Project.create(ownerId, name, description, stages)
+  2. Project.create({ orgId, ownerId: actorId, name, description, stages })
        — same invariants as manual stage management: max 20, unique names,
          gap-free positions, exactly one terminal isDone stage
   3. Persist via ProjectRepository
@@ -22,8 +115,9 @@ CreateProjectUseCase.execute({ ownerId, name, description?, stages?: StageDraft[
 ## Use Case: Generate Project Blueprint (AI-Assisted Setup)
 
 ```
-GenerateProjectBlueprintUseCase.execute({ userId, prompt, projectType? })
+GenerateProjectBlueprintUseCase.execute({ orgId, actorId, prompt, projectType? })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. Validate input: prompt non-empty, ≤ 2000 chars
   2. Call ProjectBlueprintGeneratorPort.generate({ prompt, projectType })
        — adapter talks to the LLM (see 06-ai-project-blueprint.md)
@@ -35,13 +129,14 @@ GenerateProjectBlueprintUseCase.execute({ userId, prompt, projectType? })
 
 **Boundary**: Project Management Context. The AI is behind `ProjectBlueprintGeneratorPort` (domain port) implemented in `infrastructure/ai/` — domain/application have no LLM SDK dependency. The blueprint itself is a **Value Object**, never an aggregate or a table.
 
-> **Create-from-blueprint**: the client confirms/edits the blueprint, then posts it to `CreateProjectUseCase` (`POST /api/projects`), which accepts an optional `stages[]`. There is no separate "blueprint" entity to persist.
+> **Create-from-blueprint**: the client confirms/edits the blueprint, then posts it to `CreateProjectUseCase` (`POST /api/organizations/:orgId/projects`), which accepts an optional `stages[]`. There is no separate "blueprint" entity to persist.
 
 ## Use Case: Add Stage to Project
 
 ```
-AddStageUseCase.execute(projectId, input)
+AddStageUseCase.execute({ orgId, actorId, projectId, input })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. Load Project aggregate
   2. Project.addStage(name, color) — business rule: max 20 stages
   3. Persist via ProjectRepository
@@ -57,8 +152,9 @@ AddStageUseCase.execute(projectId, input)
 ## Use Case: Reorder Stage
 
 ```
-ReorderStageUseCase.execute(projectId, stageId, newPosition)
+ReorderStageUseCase.execute({ orgId, actorId, projectId, stageId, newPosition })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. Load Project aggregate
   2. Project.reorderStage(stageId, newPosition) — shifts positions
   3. Persist via ProjectRepository
@@ -69,10 +165,12 @@ ReorderStageUseCase.execute(projectId, stageId, newPosition)
 ## Use Case: Create Task
 
 ```
-CreateTaskUseCase.execute(projectId, input)
+CreateTaskUseCase.execute({ orgId, actorId, projectId, input })
 
-  1. Validate Project exists (cross-module read → ProjectQueryPort)
-  2. Validate Stage exists (if stageId provided → StageQueryPort)
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
+  1. Validate Project exists AND project.organizationId === orgId
+       (cross-module read → ProjectQueryPort)
+  2. Validate Stage exists AND stage.organizationId === orgId (if stageId provided → StageQueryPort)
   3. Create Task aggregate root
   4. If assigneeIds provided: create TaskAssignment entities
   5. Persist via TaskRepository
@@ -85,10 +183,12 @@ CreateTaskUseCase.execute(projectId, input)
 ## Use Case: Move Task Between Stages (Drag & Drop)
 
 ```
-MoveTaskUseCase.execute(input: { taskId, targetStageId, targetPosition })
+MoveTaskUseCase.execute({ orgId, actorId, taskId, targetStageId, targetPosition })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. Load Task aggregate
-  2. Validate target Stage belongs to the same Project (cross-module read → StageQueryPort)
+  2. Validate target Stage belongs to the same Project and same org
+       (cross-module read → StageQueryPort returns organizationId)
   3. Task.moveTo(targetStageId, targetPosition) — returns TaskMovedEvent
   4. Persist via TaskRepository (atomic position shift)
   5. Publish TaskMovedEvent via RabbitMQ
@@ -128,8 +228,9 @@ async shiftPositions(stageId: string, fromPosition: number, toPosition: number) 
 ## Use Case: Reorder Task Within Stage
 
 ```
-ReorderTaskUseCase.execute(taskId, newPosition)
+ReorderTaskUseCase.execute({ orgId, actorId, taskId, newPosition })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. Load Task aggregate
   2. Validate task is in same stage
   3. Task.reorder(newPosition) — shifts positions within stage
@@ -140,21 +241,24 @@ ReorderTaskUseCase.execute(taskId, newPosition)
 ## Use Case: Assign Task
 
 ```
-AssignTaskUseCase.execute(taskId, userIds[])
+AssignTaskUseCase.execute({ orgId, actorId, taskId, userIds[] })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. Load Task aggregate
   2. Validate Users exist (cross-module read → UserQueryPort)
-  3. Create TaskAssignment entities (within Task aggregate)
-  4. Persist via TaskRepository
-  5. Raise TaskAssignedEvent for each new assignment
-  6. Return updated Task with assignments
+  3. Validate assignees are members of the same org (MembershipQueryPort)
+  4. Create TaskAssignment entities (within Task aggregate)
+  5. Persist via TaskRepository
+  6. Raise TaskAssignedEvent for each new assignment
+  7. Return updated Task with assignments
 ```
 
 ## Use Case: Add Comment
 
 ```
-AddCommentUseCase.execute(taskId, authorId, content)
+AddCommentUseCase.execute({ orgId, actorId, taskId, content })
 
+  0. Verify (orgId, actorId) membership (MembershipQueryPort) — reject VIEWER
   1. Load Task aggregate
   2. Create TaskComment entity
   3. Persist via TaskRepository
@@ -172,7 +276,7 @@ Tasks support priority levels (`LOW`, `MEDIUM`, `HIGH`, `URGENT`) and can be fil
 
 ## Reports & Analytics Use Cases (Read-Only)
 
-> The Reports context is a **query/read side**. It has NO aggregates and issues NO write commands. It builds projections by reading the `Task`, `TaskAssignment`, and `Stage` tables (optionally cached in Redis or a materialized snapshot).
+> The Reports context is a **query/read side**. It has NO aggregates and issues NO write commands. It builds projections by reading the `Task`, `TaskAssignment`, and `Stage` tables (optionally cached in Redis or a materialized snapshot). **Scoping**: every report runs inside `/:orgId` and validates membership via `MembershipQueryPort`; project-level reports also validate the project belongs to `:orgId` via `ProjectQueryPort`. Because they are read-only and lag-tolerant, report queries are served from **read replicas** (see [07-infrastructure-scaling.md](07-infrastructure-scaling.md)).
 
 ### Use Case: Get Project Dashboard Summary
 
@@ -266,31 +370,78 @@ GetProjectAssigneeActivityUseCase.execute(projectId, { range })
     GROUP BY u.name
 ```
 
-### Use Case: Get User (Global) Dashboard
+### Use Case: Get Organization (Tenant) Dashboard
 
 ```
-GetUserDashboardSummaryUseCase.execute(userId)
+GetOrganizationSummaryUseCase.execute({ orgId, actorId, range })
 
-  Aggregates across ALL of the user's projects:
-    projectCount   = COUNT(projects owned)
-    totalTasks     = SUM over projects
+  Aggregates across ALL projects in the organization:
+    projectCount   = COUNT(projects where organization_id = :orgId)
+    totalTasks     = COUNT(tasks where organization_id = :orgId)
     openTasks      = SUM tasks not completed
     overdueTasks   = COUNT(dueDate < now AND not completed)
     completionRate = completed / total * 100
     activityTrend  = last 7 days completions (for sparkline)
 ```
 
+### Use Case: Get Organization Tasks By Stage
+
+```
+GetOrganizationTasksByStageUseCase.execute({ orgId, actorId })
+
+  SELECT s.name, s.position, COUNT(t.id) as count
+  FROM stage s
+  LEFT JOIN task t ON t.stage_id = s.id
+  WHERE s.organization_id = :orgId
+  GROUP BY s.id, s.name, s.position
+  ORDER BY s.position
+```
+
+### Use Case: Get Organization Velocity / Throughput
+
+```
+GetOrganizationVelocityUseCase.execute({ orgId, actorId }, { range: 'week' })
+
+  SELECT date_trunc(:bucket, t.completed_at) AS bucket, COUNT(t.id) AS completed
+  FROM task t
+  WHERE t.organization_id = :orgId
+    AND t.completed_at IS NOT NULL
+    AND t.completed_at BETWEEN :from AND :to
+  GROUP BY bucket ORDER BY bucket
+```
+
+### Use Case: Get Organization Overdue / Upcoming
+
+```
+GetOrganizationOverdueTasksUseCase.execute({ orgId, actorId })
+  → SELECT tasks WHERE organization_id = :orgId AND due_date < now AND completed_at IS NULL
+GetOrganizationUpcomingTasksUseCase.execute({ orgId, actorId }, { days })
+  → SELECT tasks WHERE organization_id = :orgId AND due_date BETWEEN now AND now + :days
+```
+
+### Use Case: Get Organization Workload / Assignee Activity
+
+```
+GetOrganizationWorkloadUseCase.execute({ orgId, actorId })
+  → per-assignee open task counts across the org (same shape as project workload,
+    filtered by t.organization_id = :orgId)
+GetOrganizationAssigneeActivityUseCase.execute({ orgId, actorId }, { range })
+  → completed tasks per assignee within a time window, org-wide
+```
+
+> Note: each org report use case verifies membership (≥ MEMBER) up front via `MembershipQueryPort`, then queries by `organization_id`. All report SQL filters by `organization_id` so data never leaks across tenants.
+
 ## Reports Caching Strategy
 
 | Strategy | When | Mechanism |
 |----------|------|-----------|
 | **Direct SQL aggregation** | Default, small/medium data | Prisma `groupBy` / raw `pg` queries |
-| **Redis cache** | Frequent dashboard loads | Cache JSON by `(userId, projectId, range, filters)`; TTL 5 min |
+| **Redis cache** | Frequent dashboard loads | Cache JSON by `(orgId, projectId, range, filters)`; TTL 5 min |
 | **Materialized snapshot** | Large datasets / heavy velocity | Worker maintains `TaskSnapshot` from `TaskMoved`/`TaskCompleted` events |
 
 **Cache-aside pattern**:
 ```
-1. Check Redis key report:{scope}:{id}:{report}:{range}
+1. Check Redis key report:org:{orgId}:{report}:{range}   (project reports: report:project:{id}:...)
 2. Hit → return cached JSON
 3. Miss → run aggregation, store, return
 4. Invalidate on TaskMoved/TaskCompleted (or TTL)
@@ -299,7 +450,8 @@ GetUserDashboardSummaryUseCase.execute(userId)
 ## Security Considerations
 
 - All endpoints require JWT authentication (`authenticate` middleware)
-- Project access: only owner can modify (add `authorizeProject` middleware)
-- Task move: validate stage belongs to same project
+- Every `/organizations/:orgId/...` route runs `authorizeMembership({ orgId, minRole })` — rejects non-members; `VIEWER` is read-only
+- Project access: only members of the org can access, writes require ADMIN/MEMBER — `authorizeProject` middleware
+- Task move: validate stage belongs to same project and same org
 - Stage delete: validate not the last stage (min 1 required)
 - Rate limiting: reuse existing `rateLimiter` middleware

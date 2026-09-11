@@ -23,18 +23,22 @@ Nothing is persisted by the AI. The user **reviews/edits** the blueprint, then c
 
 ```
 Step 1                                    Step 2
-POST /api/projects/blueprint             POST /api/projects
+POST /api/organizations/:orgId/projects/blueprint
+                                          POST /api/organizations/:orgId/projects
 { prompt: "..." }  ────────────────►    { name, description,
                                           stages: [ {name, color, isDone}, ... ] }
-   GenerateProjectBlueprintUseCase           CreateProjectUseCase
-     │                                        │  Project.create(name, stages)  ← same
-     │  call BlueprintGeneratorPort            │   invariants as manual creation
+   authorizeMembership(:orgId)                authorizeMembership(:orgId)
+   GenerateProjectBlueprintUseCase            │  CreateProjectUseCase
+     │                                        │  Project.create({ orgId, ... }, stages)
+     │  call BlueprintGeneratorPort            │   ← same invariants as manual creation
      │  validate + normalize                   ▼
-     ▼                                      Project + Stages persisted
+     ▼                                      Project + Stages persisted (org-scoped)
    returns ProjectBlueprint (NOT saved)     ProjectCreatedEvent raised
      │
      └── user reviews/edits in UI, then Step 2
 ```
+
+> **Tenancy**: `:orgId` comes from the URL and is the tenant boundary. Both endpoints run `authorizeMembership` (reject `VIEWER`); the use cases re-validate membership via `MembershipQueryPort`. The generated project is always created inside that organization.
 
 ## Domain Model (Project Management context)
 
@@ -56,7 +60,7 @@ export interface ProjectBlueprintGeneratorPort {
 }
 ```
 
-**Invariants** — enforced by `Project.create(ownerId, name, description, stages)` in the `Project` aggregate — the **exact same code path** as manual stage management (`AddStageUseCase`):
+**Invariants** — enforced by `Project.create({ orgId, ownerId, name, description, stages })` in the `Project` aggregate — the exact same code path as manual creation (`AddStageUseCase`, `CreateProjectUseCase`):
 
 - 1..20 stages; names unique (case-insensitive) within the project
 - Exactly one stage flagged `isDone` — if the AI omits it, the aggregate auto-flags the **last** stage
@@ -66,14 +70,15 @@ export interface ProjectBlueprintGeneratorPort {
 ## Use Case: Generate Project Blueprint
 
 ```
-GenerateProjectBlueprintUseCase.execute({ userId, prompt, projectType? })
+GenerateProjectBlueprintUseCase.execute({ orgId, actorId, prompt, projectType? })
 
-  1. (interfaces layer) — authenticate user
+  1. (interfaces layer) — authenticate user + authorizeMembership(:orgId, ≥ MEMBER)
   2. Validate input: prompt non-empty, ≤ 2000 chars (project.validator)
-  3. Call ProjectBlueprintGeneratorPort.generate({ prompt, projectType })
-  4. If result is null OR fails `Project.create()` invariants:
+  3. Verify (orgId, actorId) membership via MembershipQueryPort (defense in depth)
+  4. Call ProjectBlueprintGeneratorPort.generate({ prompt, projectType })
+  5. If result is null OR fails `Project.create()` invariants:
         → fall back to the default blueprint (Backlog, To Do, In Progress, In Review, Done)
-  5. Return ProjectBlueprint  ← nothing persisted, nothing creates stages yet
+  6. Return ProjectBlueprint  ← nothing persisted, nothing creates stages yet
 ```
 
 **Boundary**: Project Management Context. The caller (blueprint endpoint) never creates anything; creation stays the job of `CreateProjectUseCase`.
@@ -81,28 +86,29 @@ GenerateProjectBlueprintUseCase.execute({ userId, prompt, projectType? })
 ## Use Case: Create Project (Extended — accepts stages)
 
 ```
-CreateProjectUseCase.execute({ ownerId, name?, description?, stages?: StageDraft[] })
+CreateProjectUseCase.execute({ orgId, actorId, name?, description?, stages?: StageDraft[] })
 
+  0. Verify (orgId, actorId) membership via MembershipQueryPort (reject VIEWER)
   1. If stages omitted → use default 5 stages
-  2. Project.create(ownerId, name, description, stages)
+  2. Project.create({ orgId, ownerId: actorId, name, description, stages })
        — enforces the invariants above (max 20, unique names, gap-free, one isDone)
   3. Persist via ProjectRepository; raise ProjectCreatedEvent
   4. Return Project aggregate with Stages
 ```
 
-`POST /api/projects` now accepts an optional `stages` array. Clients that called the blueprint endpoint simply post the blueprint fields back (optionally after editing them).
+`POST /api/organizations/:orgId/projects` now accepts an optional `stages` array. Clients that called the blueprint endpoint simply post the blueprint fields back (optionally after editing them).
 
 ## API
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects/blueprint` | Generate project blueprint from a prompt (AI, **no writes**) | `GenerateProjectBlueprintUseCase` |
-| POST | `/api/projects` | Create project — `stages` optional (from blueprint or manual) | `CreateProjectUseCase` |
+| POST | `/api/organizations/:orgId/projects/blueprint` | Generate project blueprint from a prompt (AI, **no writes**) | `GenerateProjectBlueprintUseCase` |
+| POST | `/api/organizations/:orgId/projects` | Create project — `stages` optional (from blueprint or manual) | `CreateProjectUseCase` |
 
 **Request — blueprint**
 
 ```json
-POST /api/projects/blueprint
+POST /api/organizations/61f2c1a8-.../projects/blueprint
 { "prompt": "A mobile app for booking dog walks", "projectType": "software" }
 ```
 
@@ -125,7 +131,7 @@ POST /api/projects/blueprint
 **Request — create** (the client confirms/edits, then posts)
 
 ```json
-POST /api/projects
+POST /api/organizations/61f2c1a8-.../projects
 {
   "name": "DogWalks Mobile App",
   "description": "Booking and scheduling for dog walkers",
@@ -149,7 +155,7 @@ POST /api/projects
 
 ## Cross-Cutting Concerns
 
-- **Auth**: both endpoints require the existing `authenticate` JWT middleware.
+- **Auth**: both endpoints require the existing `authenticate` JWT middleware + `authorizeMembership(:orgId, ≥ MEMBER)`.
 - **Rate limiting**: reuse `rateLimiter` on the blueprint endpoint — every call has a real LLM cost.
 - **Cost caps**: limit generated stages (≤ 20), prompt length (≤ 2000 chars); make `LLM_MAX_STAGES` configurable.
 - **Security**: model output is data, not instructions — it is validated against domain invariants and never executed.
@@ -158,7 +164,7 @@ POST /api/projects
 
 - **Unit**: `Project.create()` invariant tests with blueprint stages (count, uniqueness, `isDone`, gap-free); `GenerateProjectBlueprintUseCase` with an **injected fake** `ProjectBlueprintGeneratorPort`.
 - **Adapter**: provider adapter tested against a recorded fixture (no live API in CI).
-- **Integration**: two-step flow — `POST /blueprint` (fake port) → `POST /projects` with returned stages → GET project returns stages in order.
+- **Integration**: two-step flow — `POST /api/organizations/:orgId/projects/blueprint` (fake port) → `POST /api/organizations/:orgId/projects` with returned stages → GET project returns stages in order; cross-tenant access to the org's blueprint endpoint is rejected.
 - **Fallback**: generator returns `null` → blueprint endpoint returns the default 5-stage blueprint.
 
 ## Open Questions

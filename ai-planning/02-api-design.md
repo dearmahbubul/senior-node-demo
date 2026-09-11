@@ -2,29 +2,70 @@
 
 All endpoints are prefixed with `/api` and require JWT authentication.
 
-> **Model**: ClickUp-style. A **Project** (ClickUp List) owns **Stages** (ClickUp Statuses) directly — there is **no separate Pipeline entity**. Stages are ordered by `position` on the project.
+> **Model**: ClickUp-style. An **Organization** (ClickUp Workspace) is the **tenant**. It owns **Projects** (ClickUp Lists), each owning **Stages** (ClickUp Statuses) directly — no separate Pipeline entity. All tenant-scoped routes are nested under `/organizations/:orgId`; the `:orgId` always comes from the URL, never from the request body.
 
-## Project Management Context
+## Organization Management Context (Tenancy)
 
-### Projects
+### Organizations
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects/blueprint` | Generate a project blueprint (name, description, stages) from a prompt — **AI, no writes, nothing persisted** | `GenerateProjectBlueprintUseCase` |
-| POST | `/api/projects` | Create project — optional `stages[]` (from blueprint/manual), else auto-creates default stages | `CreateProjectUseCase` |
-| GET | `/api/projects` | List user's projects | `ListProjectsUseCase` |
-| GET | `/api/projects/:id` | Get project detail with stages | `GetProjectUseCase` |
-| PATCH | `/api/projects/:id` | Update project name/description | `UpdateProjectUseCase` |
-| DELETE | `/api/projects/:id` | Delete project (cascades stages, tasks) | `DeleteProjectUseCase` |
+| POST | `/api/organizations` | Create an organization (first user becomes OWNER) | `CreateOrganizationUseCase` |
+| GET | `/api/organizations` | List the caller's organizations | `ListOrganizationsUseCase` |
+| GET | `/api/organizations/:orgId` | Get organization detail + membership | `GetOrganizationUseCase` |
+| PATCH | `/api/organizations/:orgId` | Update name/slug (OWNER/ADMIN) | `UpdateOrganizationUseCase` |
+| DELETE | `/api/organizations/:orgId` | Delete organization (cascades projects/stages/tasks) | `DeleteOrganizationUseCase` |
+
+### Membership & Roles
+
+| Method | Endpoint | Description | Use Case |
+|--------|----------|-------------|----------|
+| POST | `/api/organizations/:orgId/members` | Add member (OWNER/ADMIN) | `AddMemberUseCase` |
+| GET | `/api/organizations/:orgId/members` | List members + roles | `ListMembersUseCase` |
+| PATCH | `/api/organizations/:orgId/members/:userId` | Change member role | `UpdateMemberRoleUseCase` |
+| DELETE | `/api/organizations/:orgId/members/:userId` | Remove member | `RemoveMemberUseCase` |
+
+### Tenant Domains (Host-Based Routing)
+
+Every **Organization gets a default subdomain when created**; an OWNER/ADMIN can later add (and verify) an optional **custom domain**.
+
+| What | Example |
+|------|---------|
+| Default tenant URL (auto-provisioned from slug) | `https://acme.taskflow.app/...` — base host from `APP_BASE_HOST` |
+| Custom domain (after DNS verification) | `https://app.acme.com/...` — overrides the subdomain |
+
+**Mechanics**: the `resolveTenant` middleware (mounted before all API routes) reads the `Host` header, resolves it via `organizationQueries.findByHost(host)` (exact custom-domain match first, then `*.APP_BASE_HOST` subdomain match — both reads go to the **primary** DB, see `07`), and stashes the org id on `res.locals.organizationId`. All `:orgId`-scoped routes trust this value; a request that matches no tenant is rejected.
+
+| Method | Endpoint | Description | Use Case |
+|--------|----------|-------------|----------|
+| PATCH | `/api/organizations/:orgId/domain` | Change the organization subdomain (`{ subdomain }`) — OWNER/ADMIN | `UpdateSubdomainUseCase` |
+| POST | `/api/organizations/:orgId/custom-domain` | Request a custom domain — returns a **DNS TXT token** (`_taskflow-verification.<domain>`); nothing changes until verified | `RequestCustomDomainUseCase` |
+| POST | `/api/organizations/:orgId/custom-domain/verify` | Verify the TXT record and **activate** the custom domain; `409` if the record is missing/incorrect | `VerifyCustomDomainUseCase` |
+| DELETE | `/api/organizations/:orgId/custom-domain` | Remove the custom domain — tenant reverts to the subdomain | `RemoveCustomDomainUseCase` |
+
+> **Note**: On signup the Auth module auto-creates a parent **personal Organization** (`OrganizationCreatedEvent`) so every existing flow (projects/tasks) immediately has a tenant — and a working subdomain — to belong to.
+
+## Project Management Context
+
+### Projects (tenant-scoped)
+
+| Method | Endpoint | Description | Use Case |
+|--------|----------|-------------|----------|
+| POST | `/api/organizations/:orgId/projects/blueprint` | Generate a project blueprint (name, description, stages) from a prompt — **AI, no writes** | `GenerateProjectBlueprintUseCase` |
+| POST | `/api/organizations/:orgId/projects` | Create project — optional `stages[]`, else default stages | `CreateProjectUseCase` |
+| GET | `/api/organizations/:orgId/projects` | List projects in the organization | `ListProjectsUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId` | Get project detail with stages | `GetProjectUseCase` |
+| PATCH | `/api/organizations/:orgId/projects/:projectId` | Update name/description | `UpdateProjectUseCase` |
+| DELETE | `/api/organizations/:orgId/projects/:projectId` | Delete project (cascades stages, tasks) | `DeleteProjectUseCase` |
 
 ### Stages (owned directly by a Project — no pipeline)
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects/:projectId/stages` | Add a new stage to project | `AddStageUseCase` |
-| PATCH | `/api/projects/:projectId/stages/:id` | Update stage name/color | `UpdateStageUseCase` |
-| PATCH | `/api/projects/:projectId/stages/:id/reorder` | Reorder stage position | `ReorderStageUseCase` |
-| DELETE | `/api/projects/:projectId/stages/:id` | Delete stage (tasks become unstage) | `DeleteStageUseCase` |
+| POST | `/api/organizations/:orgId/projects/:projectId/stages` | Add a new stage to project | `AddStageUseCase` |
+| PATCH | `/api/organizations/:orgId/projects/:projectId/stages/:stageId` | Update stage name/color | `UpdateStageUseCase` |
+| PATCH | `/api/organizations/:orgId/projects/:projectId/stages/:stageId/reorder` | Reorder stage position | `ReorderStageUseCase` |
+| DELETE | `/api/organizations/:orgId/projects/:projectId/stages/:stageId` | Delete stage (tasks become unstage) | `DeleteStageUseCase` |
 
 ## Task Board Context
 
@@ -32,55 +73,56 @@ All endpoints are prefixed with `/api` and require JWT authentication.
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects/:projectId/tasks` | Create task in a stage | `CreateTaskUseCase` |
-| GET | `/api/projects/:projectId/tasks` | List tasks (filterable by stage, priority, assignee) | `ListTasksUseCase` |
-| GET | `/api/projects/:projectId/tasks/:id` | Get task detail | `GetTaskUseCase` |
-| PATCH | `/api/projects/:projectId/tasks/:id` | Update task (title, description, priority, dueDate) | `UpdateTaskUseCase` |
-| PATCH | `/api/projects/:projectId/tasks/:id/move` | **Move task** to another stage + position | `MoveTaskUseCase` |
-| PATCH | `/api/projects/:projectId/tasks/:id/reorder` | Reorder task within same stage | `ReorderTaskUseCase` |
-| DELETE | `/api/projects/:projectId/tasks/:id` | Delete task | `DeleteTaskUseCase` |
+| POST | `/api/organizations/:orgId/projects/:projectId/tasks` | Create task in a stage | `CreateTaskUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/tasks` | List tasks (filter by stage, priority, assignee) | `ListTasksUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId` | Get task detail | `GetTaskUseCase` |
+| PATCH | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId` | Update task (title, description, priority, dueDate) | `UpdateTaskUseCase` |
+| PATCH | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/move` | **Move task** to another stage + position | `MoveTaskUseCase` |
+| PATCH | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/reorder` | Reorder task within same stage | `ReorderTaskUseCase` |
+| DELETE | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId` | Delete task | `DeleteTaskUseCase` |
 
 ### Task Assignments
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects/:projectId/tasks/:taskId/assign` | Assign user(s) to task | `AssignTaskUseCase` |
-| DELETE | `/api/projects/:projectId/tasks/:taskId/assign/:userId` | Unassign user | `UnassignTaskUseCase` |
-| GET | `/api/projects/:projectId/tasks/:taskId/assignments` | List assignees | `GetTaskUseCase` (includes assignments) |
+| POST | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/assign` | Assign user(s) to task | `AssignTaskUseCase` |
+| DELETE | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/assign/:userId` | Unassign user | `UnassignTaskUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/assignments` | List assignees | `GetTaskUseCase` (includes assignments) |
 
 ### Task Comments
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| POST | `/api/projects/:projectId/tasks/:taskId/comments` | Add comment | `AddCommentUseCase` |
-| GET | `/api/projects/:projectId/tasks/:taskId/comments` | List comments | `GetTaskUseCase` (includes comments) |
-| DELETE | `/api/projects/:projectId/tasks/:taskId/comments/:commentId` | Delete comment | `DeleteCommentUseCase` |
+| POST | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/comments` | Add comment | `AddCommentUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/comments` | List comments | `GetTaskUseCase` (includes comments) |
+| DELETE | `/api/organizations/:orgId/projects/:projectId/tasks/:taskId/comments/:commentId` | Delete comment | `DeleteCommentUseCase` |
 
 ## Reports & Analytics Context
 
-### User Dashboard (Global — across all user's projects)
+### Organization Dashboard (per tenant)
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| GET | `/api/reports/user/summary` | Overall user metrics (projects, tasks, completion rate) | `GetUserDashboardSummaryUseCase` |
-| GET | `/api/reports/user/tasks-by-stage` | Tasks grouped by stage across all projects | `GetUserTasksByStageUseCase` |
-| GET | `/api/reports/user/tasks-by-priority` | Tasks grouped by priority | `GetUserTasksByPriorityUseCase` |
-| GET | `/api/reports/user/velocity?range=week` | Completed tasks per day/week (throughput trend) | `GetUserVelocityUseCase` |
-| GET | `/api/reports/user/overdue` | List of overdue tasks (all projects) | `GetUserOverdueTasksUseCase` |
-| GET | `/api/reports/user/upcoming?days=7` | Tasks due within a window | `GetUserUpcomingTasksUseCase` |
-| GET | `/api/reports/user/workload` | Tasks per assignee (via assignments) | `GetUserWorkloadUseCase` |
+| GET | `/api/organizations/:orgId/reports/summary` | Org metrics (projects, tasks, completion rate) | `GetOrganizationSummaryUseCase` |
+| GET | `/api/organizations/:orgId/reports/tasks-by-stage` | Tasks grouped by stage across org projects | `GetOrganizationTasksByStageUseCase` |
+| GET | `/api/organizations/:orgId/reports/tasks-by-priority` | Tasks grouped by priority | `GetOrganizationTasksByPriorityUseCase` |
+| GET | `/api/organizations/:orgId/reports/velocity?range=week` | Throughput over time | `GetOrganizationVelocityUseCase` |
+| GET | `/api/organizations/:orgId/reports/overdue` | Overdue tasks | `GetOrganizationOverdueTasksUseCase` |
+| GET | `/api/organizations/:orgId/reports/upcoming?days=7` | Tasks due within a window | `GetOrganizationUpcomingTasksUseCase` |
+| GET | `/api/organizations/:orgId/reports/workload` | Per-assignee open task counts | `GetOrganizationWorkloadUseCase` |
+| GET | `/api/organizations/:orgId/reports/assignee-activity` | Completed tasks per assignee over range | `GetOrganizationAssigneeActivityUseCase` |
 
-### Project Dashboard (Per Project)
+### Project Dashboard (within an org)
 
 | Method | Endpoint | Description | Use Case |
 |--------|----------|-------------|----------|
-| GET | `/api/projects/:projectId/reports/summary` | Project metrics (total, done, active, completion rate) | `GetProjectDashboardSummaryUseCase` |
-| GET | `/api/projects/:projectId/reports/tasks-by-stage` | Task distribution by stage (board counts) | `GetProjectTasksByStageUseCase` |
-| GET | `/api/projects/:projectId/reports/tasks-by-priority` | Task distribution by priority | `GetProjectTasksByPriorityUseCase` |
-| GET | `/api/projects/:projectId/reports/velocity?range=week` | Project throughput over time | `GetProjectVelocityUseCase` |
-| GET | `/api/projects/:projectId/reports/aging` | Task age distribution (0-1d, 1-3d, 3-7d, 7-14d, 14d+) | `GetProjectTaskAgingUseCase` |
-| GET | `/api/projects/:projectId/reports/workload` | Per-assignee open task counts | `GetProjectWorkloadUseCase` |
-| GET | `/api/projects/:projectId/reports/assignee-activity` | Completed tasks per assignee over range | `GetProjectAssigneeActivityUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/reports/summary` | Project metrics (total, done, active, completion rate) | `GetProjectSummaryUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/reports/tasks-by-stage` | Task distribution by stage (board counts) | `GetProjectTasksByStageUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/reports/tasks-by-priority` | Task distribution by priority | `GetProjectTasksByPriorityUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/reports/velocity?range=week` | Project throughput over time | `GetProjectVelocityUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/reports/aging` | Task age distribution (0-1d, 1-3d, 3-7d, 7-14d, 14d+) | `GetProjectTaskAgingUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/reports/workload` | Per-assignee open task counts | `GetProjectWorkloadUseCase` |
+| GET | `/api/organizations/:orgId/projects/:projectId/reports/assignee-activity` | Completed tasks per assignee over range | `GetProjectAssigneeActivityUseCase` |
 
 ### Reusable Query Parameters
 
@@ -92,22 +134,26 @@ All endpoints are prefixed with `/api` and require JWT authentication.
 | `priority` | `LOW \| MEDIUM \| HIGH \| URGENT` | project reports | Filter by priority |
 | `assigneeId` | UUID | project reports | Filter by assignee |
 
-> **Note**: All report endpoints are **read-only**. They never mutate domain state — they only query/aggregate task data or consume event-driven projections.
+> **Note**: All report endpoints are **read-only** and lag-tolerant — they are the primary candidates to run against DB **read replicas** (see [07-infrastructure-scaling.md](07-infrastructure-scaling.md)).
 
 ## Route Registration
 
 ```typescript
 // src/routes/index.ts
+import { resolveTenant } from '@common/middleware/resolve-tenant';
+import organizationRoutes from '@modules/organization-management/interfaces/http/organization.routes';
 import projectRoutes from '@modules/project-management/interfaces/http/project.routes';
 import taskRoutes from '@modules/task-board/interfaces/http/task.routes';
 import reportRoutes from '@modules/reports/interfaces/http/report.routes';
 
 const router = Router();
+router.use(authenticate);
+router.use(resolveTenant);                            // Host → organization (subdomain/custom domain)
 router.use('/users', userRoutes);
 router.use('/auth', authRoutes);
-router.use('/projects', projectRoutes);
-router.use('/reports', reportRoutes);
-// Stages are nested under projects: /api/projects/:projectId/stages
-// Tasks are nested under projects: /api/projects/:projectId/tasks
-// Project reports: /api/projects/:projectId/reports/...
+router.use('/organizations', organizationRoutes);     // + /:orgId/domain, custom-domain sub-routes
+router.use('/organizations/:orgId', projectRoutes);   // projects + stages nested
+router.use('/organizations/:orgId', taskRoutes);       // tasks, assignments, comments
+router.use('/organizations/:orgId', reportRoutes);     // org + project reports
+// Every nested router reads :orgId from the URL; `authorizeMembership` runs first.
 ```

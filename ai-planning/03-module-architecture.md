@@ -79,6 +79,7 @@ Knock-on rules that keep the layers honest:
 3. **Infrastructure never imports another module's internals.** Cross-module reads go through **consumer-owned query ports** implemented as *gateways* in the consumer module (see "Cross-Module Communication Patterns").
 4. **`interfaces/` is the only place that sees HTTP.** Controllers map HTTP in/out to use-case inputs and DTOs; request validation lives in validators.
 5. **External AI/LLM providers are driven adapters, just like Prisma or RabbitMQ.** They implement a domain port (`ProjectBlueprintGeneratorPort`) in `infrastructure/ai/` via a shared `common/llm` client. Application never imports an OpenAI/Anthropic SDK — see `06-ai-project-blueprint.md`.
+6. **Tenancy is enforced at the module boundary.** `organizationId` comes only from the URL or from `Host`-based tenant resolution (`resolveTenant` middleware → `organizationQueries.findByHost`, exact custom-domain first, then `*.APP_BASE_HOST`); membership is checked by `authorizeMembership` (interface layer) *and* re-validated inside use cases through consumer-owned `MembershipQueryPort`/`OrganizationQueryPort` gateways
 
 ---
 
@@ -87,7 +88,7 @@ Knock-on rules that keep the layers honest:
 ```
 src/
 ├── common/                            SHARED INFRASTRUCTURE
-│   ├── middleware/                     — Express middleware (auth, validate, upload, rate-limit)
+│   ├── middleware/                     — Express middleware (auth, validate, upload, rate-limit, resolve-tenant)
 │   ├── errors/                        — AppError, NotFoundError, ValidationError
 │   ├── events/                        — shared RabbitMQ message-bus adapter (implements each module's event-publisher PORT)
 │   ├── storage/                       — Storage port + S3/Local adapters (existing)
@@ -102,7 +103,70 @@ src/
 │
 ├── modules/
 │   │
-│   ├── project-management/            MODULE 1: Projects + Stages
+│   ├── organization-management/       MODULE 1: Tenancy — Organizations + Membership + Domains
+│   │   │
+│   │   ├── domain/
+│   │   │   ├── entities/
+│   │   │   │   ├── organization.entity.ts
+│   │   │   │   └── organization-membership.entity.ts
+│   │   │   ├── value-objects/
+│   │   │   │   ├── org-role.vo.ts
+│   │   │   │   ├── slug.vo.ts
+│   │   │   │   ├── subdomain.vo.ts                (default tenant subdomain, immutable + unique)
+│   │   │   │   ├── custom-domain.vo.ts             (verified FQDN, unique)
+│   │   │   │   └── domain-verification-token.vo.ts  (TXT record token, regenerated per request)
+│   │   │   ├── events/
+│   │   │   │   ├── organization-created.event.ts
+│   │   │   │   ├── subdomain-changed.event.ts
+│   │   │   │   ├── custom-domain-verified.event.ts
+│   │   │   │   ├── custom-domain-removed.event.ts
+│   │   │   │   └── member-added.event.ts
+│   │   │   └── ports/
+│   │   │       ├── organization.repository.port.ts
+│   │   │       ├── organization-membership.repository.port.ts
+│   │   │       ├── organization-event-publisher.port.ts
+│   │   │       └── domain-verification.port.ts  (resolve TXT record → token match)
+│   │   │
+│   │   ├── application/
+│   │   │   ├── create-organization.use-case.ts   (auto-provisions slug + subdomain)
+│   │   │   ├── get-organization.use-case.ts
+│   │   │   ├── list-organizations.use-case.ts
+│   │   │   ├── update-organization.use-case.ts
+│   │   │   ├── delete-organization.use-case.ts
+│   │   │   ├── update-subdomain.use-case.ts
+│   │   │   ├── request-custom-domain.use-case.ts (issues verification token)
+│   │   │   ├── verify-custom-domain.use-case.ts  (checks DNS, activates)
+│   │   │   ├── remove-custom-domain.use-case.ts
+│   │   │   ├── add-member.use-case.ts
+│   │   │   ├── list-members.use-case.ts
+│   │   │   ├── update-member-role.use-case.ts
+│   │   │   └── remove-member.use-case.ts
+│   │   │
+│   │   ├── infrastructure/
+│   │   │   ├── persistence/
+│   │   │   │   ├── prisma-organization.repository.ts
+│   │   │   │   └── prisma-organization-membership.repository.ts
+│   │   │   └── verification/
+│   │   │       └── dns-verification.adapter.ts  (implements DomainVerificationPort)
+│   │   │
+│   │   ├── interfaces/
+│   │   │   ├── http/
+│   │   │   │   ├── organization.controller.ts
+│   │   │   │   ├── organization.validator.ts
+│   │   │   │   ├── organization.resource.ts
+│   │   │   │   ├── organization.routes.ts
+│   │   │   │   ├── domain.controller.ts          (subdomain + custom domain endpoints)
+│   │   │   │   ├── domain.validator.ts
+│   │   │   │   ├── domain.resource.ts
+│   │   │   │   └── domain.routes.ts   (only driving adapter for now — no queue consumers yet)
+│   │   │
+│   │   ├── index.ts                  MODULE BARREL — exports routes + `organizationQueries` facade
+│   │   │                                (findByHost, findBySubdomain, findByCustomDomain,
+│   │   │                                 hasMember, getMembershipRole)
+│   │   └── __tests__/
+│   │
+│   │
+│   ├── project-management/            MODULE 2: Projects + Stages
 │   │   │
 │   │   ├── domain/                    CORE — zero dependencies
 │   │   │   ├── entities/
@@ -121,7 +185,8 @@ src/
 │   │   │       ├── project.repository.port.ts
 │   │   │       ├── stage.repository.port.ts
 │   │   │       ├── project-event-publisher.port.ts
-│   │   │       └── project-blueprint-generator.port.ts
+│   │   │       ├── project-blueprint-generator.port.ts
+│   │   │       └── membership-query.port.ts   (consumer-owned → implemented as a gateway)
 │   │   │
 │   │   ├── application/              USE CASES — depends only on domain/
 │   │   │   ├── create-project.use-case.ts
@@ -139,8 +204,10 @@ src/
 │   │   │   ├── persistence/
 │   │   │   │   ├── prisma-project.repository.ts
 │   │   │   │   └── prisma-stage.repository.ts
-│   │   │   └── ai/
-│   │   │       └── openai-blueprint-generator.adapter.ts   (only file that knows the LLM)
+│   │   │   ├── ai/
+│   │   │   │   └── openai-blueprint-generator.adapter.ts   (only file that knows the LLM)
+│   │   │   └── gateways/            CROSS-MODULE adapters (consumer-owned)
+│   │   │       └── membership-query.gateway.ts  → organization-management barrel
 │   │   │
 │   │   ├── interfaces/               DRIVING ADAPTERS
 │   │   │   ├── http/
@@ -160,7 +227,7 @@ src/
 │   │       └── project.controller.test.ts
 │   │
 │   │
-│   ├── task-board/                   MODULE 2: Tasks, Assignments, Comments
+│   ├── task-board/                   MODULE 3: Tasks, Assignments, Comments
 │   │   │
 │   │   ├── domain/
 │   │   │   ├── entities/
@@ -180,8 +247,8 @@ src/
 │   │   │       ├── task-assignment.repository.port.ts
 │   │   │       ├── task-comment.repository.port.ts
 │   │   │       ├── task-event-publisher.port.ts
-│   │   │       ├── project-query.port.ts     (consumer-owned → implemented as a gateway)
-│   │   │       ├── stage-query.port.ts        (consumer-owned → implemented as a gateway)
+│   │   │       ├── project-query.port.ts     (returns Project + organizationId; gateway)
+│   │   │       ├── stage-query.port.ts        (returns Stage + organizationId; gateway)
 │   │   │       └── user-query.port.ts         (consumer-owned → implemented as a gateway)
 │   │   │
 │   │   ├── application/
@@ -222,7 +289,7 @@ src/
 │   │   └── __tests__/
 │   │
 │   │
-│   ├── reports/                      MODULE 3: Dashboard & Analytics (Read-only)
+│   ├── reports/                      MODULE 4: Dashboard & Analytics (Read-only)
 │   │   │
 │   │   ├── domain/
 │   │   │   ├── read-models/
@@ -236,16 +303,19 @@ src/
 │   │   │   │   └── time-range.vo.ts
 │   │   │   └── ports/
 │   │   │       ├── report-query.port.ts
-│   │   │       └── project-query.port.ts     (consumer-owned → implemented as a gateway)
+│   │   │       ├── project-query.port.ts        (consumer-owned → implemented as a gateway)
+│   │   │       ├── organization-query.port.ts   (consumer-owned → implemented as a gateway)
+│   │   │       └── membership-query.port.ts     (consumer-owned → implemented as a gateway)
 │   │   │
 │   │   ├── application/
-│   │   │   ├── get-user-summary.use-case.ts
-│   │   │   ├── get-user-tasks-by-stage.use-case.ts
-│   │   │   ├── get-user-tasks-by-priority.use-case.ts
-│   │   │   ├── get-user-velocity.use-case.ts
-│   │   │   ├── get-user-overdue.use-case.ts
-│   │   │   ├── get-user-upcoming.use-case.ts
-│   │   │   ├── get-user-workload.use-case.ts
+│   │   │   ├── get-organization-summary.use-case.ts
+│   │   │   ├── get-organization-tasks-by-stage.use-case.ts
+│   │   │   ├── get-organization-tasks-by-priority.use-case.ts
+│   │   │   ├── get-organization-velocity.use-case.ts
+│   │   │   ├── get-organization-overdue.use-case.ts
+│   │   │   ├── get-organization-upcoming.use-case.ts
+│   │   │   ├── get-organization-workload.use-case.ts
+│   │   │   ├── get-organization-assignee-activity.use-case.ts
 │   │   │   ├── get-project-summary.use-case.ts
 │   │   │   ├── get-project-tasks-by-stage.use-case.ts
 │   │   │   ├── get-project-tasks-by-priority.use-case.ts
@@ -260,7 +330,9 @@ src/
 │   │   │   ├── cache/
 │   │   │   │   └── report-cache.adapter.ts
 │   │   │   └── gateways/
-│   │   │       └── project-query.gateway.ts  → project-management barrel
+│   │   │       ├── project-query.gateway.ts      → project-management barrel
+│   │   │       ├── organization-query.gateway.ts → organization-management barrel
+│   │   │       └── membership-query.gateway.ts   → organization-management barrel
 │   │   │
 │   │   ├── interfaces/
 │   │   │   └── http/
@@ -273,7 +345,7 @@ src/
 │   │   └── __tests__/
 │   │
 │   │
-│   └── auth/                         MODULE 4: Auth (existing — refactor)
+│   └── auth/                         MODULE 5: Auth (existing — refactor)
 │       ├── domain/                    (keep as-is or extract JWT util here)
 │       ├── application/               (login, register use cases)
 │       ├── infrastructure/            (JWT adapter, bcrypt adapter)
@@ -471,6 +543,15 @@ For **asynchronous** cross-module communication:
 Each module exposes only what other modules (or the main app) can use. Nothing else is accessible.
 
 ```typescript
+// modules/organization-management/index.ts
+export { organizationModuleRoutes } from './interfaces/http/organization.routes';
+export { domainModuleRoutes } from './interfaces/http/domain.routes';
+export { OrganizationModule } from './organization-management.module';
+export { organizationQueries } from './organization-queries';
+// organizationQueries: { findByHost(host): Org|null, hasMember(orgId, userId, minRole?), getMembershipRole(...), findBySlug(slug) }
+```
+
+```typescript
 // modules/project-management/index.ts
 export { projectModuleRoutes } from './interfaces/http/project.routes';
 export { ProjectModule } from './project-management.module';
@@ -483,6 +564,8 @@ export { TaskModule } from './task-board.module';
 ```
 
 > **Cross-module access rule**: module A may **only** import `@modules/b` (its barrel `index.ts`). Barrels export routes, the module class, and the *public query facades* that other modules' gateways call. A consumer's gateway never imports `b/infrastructure/...` or `b/domain/...` directly — only the provider's barrel.
+
+> **Tenancy rule**: the `organizationId` in URLs is the tenant boundary. In most API requests the tenant is resolved from the `Host` header by the `resolveTenant` middleware (custom domain → `organizationQueries.findByHost(host)`; subdomain → `*.APP_BASE_HOST`). Organization-scoped routes require `authorizeMembership`; use cases additionally re-validate via `MembershipQueryPort`/`ProjectQueryPort.stage.organizationId`. Never trust a client-supplied `organizationId` in the request body.
 
 ---
 
@@ -501,14 +584,15 @@ export { TaskModule } from './task-board.module';
 ## Migration Path (From Current Codebase)
 
 1. Create `src/modules/` directory structure
-2. Move `src/modules/tasks/` → `src/modules/task-board/` with new internal layers
-3. Extract `TaskRepositoryPort` from existing `task.repository.ts`
-4. Move existing repository to `infrastructure/persistence/`
-5. Create `src/common/di/container.ts` (composition root)
-6. Move `src/modules/projects/` → `src/modules/project-management/`
-7. Create new `src/modules/reports/` module
-8. Refactor controllers to call use cases from the composition root
-9. Update `src/app.ts` and `src/routes/index.ts` to use module barrel exports
+2. Create `src/modules/organization-management/` (new tenant module) + `organizationId` columns on `Project`/`Stage`/`Task`
+3. Move `src/modules/tasks/` → `src/modules/task-board/` with new internal layers
+4. Extract `TaskRepositoryPort` from existing `task.repository.ts`
+5. Move existing repository to `infrastructure/persistence/`
+6. Create `src/common/di/container.ts` (composition root)
+7. Move `src/modules/projects/` → `src/modules/project-management/`
+8. Create new `src/modules/reports/` module
+9. Refactor controllers to call use cases from the composition root
+10. Update `src/app.ts` and `src/routes/index.ts` to use module barrel exports
 
 ---
 
@@ -516,10 +600,10 @@ export { TaskModule } from './task-board.module';
 
 | Layer | Files |
 |-------|-------|
-| domain/ (entities, VOs, events, ports) | ~21 |
-| application/ (use cases) | ~21 |
-| infrastructure/ (adapters + cross-module gateways) | ~14 |
-| interfaces/ (HTTP + queue consumers) | ~12 |
+| domain/ (entities, VOs, events, ports) | ~34 |
+| application/ (use cases) | ~34 |
+| infrastructure/ (adapters + cross-module gateways) | ~20 |
+| interfaces/ (HTTP + queue consumers) | ~20 |
 | di/ (composition root) | 3 |
 | __tests__/ | colocated |
-| **Total new files** | **~71** |
+| **Total new files** | **~111** (incl. shared `resolveTenant` middleware) |

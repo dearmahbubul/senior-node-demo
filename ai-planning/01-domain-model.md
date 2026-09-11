@@ -2,12 +2,16 @@
 
 ## Vision
 
-A multi-tenant task management system where:
+A **multi-tenant** task management system where:
 
-- Each **User** owns one or more **Projects**
+- Each **User** can belong to one or more **Organizations** (Workspaces) — the tenant boundary
+- Each **Organization** owns one or more **Projects**
+- Each **Organization** gets a **default subdomain** on creation (`acme.taskflow.app`) and can later activate its own **custom domain** (`app.acme.com`) — host-based tenancy
 - Each **Project** has an ordered list of **Stages** (columns) — ClickUp-style, no separate Pipeline entity
 - **Tasks** live inside a Stage and can be dragged/reordered/moved between Stages
 - Everything is exposed as REST APIs with full CRUD + drag-and-drop support
+
+**Tenancy**: (shared-DB / pooled model with **host-based resolution**) — all tenant-owned data carries `organizationId`, and every query is scoped to the caller's organization. Isolation is row-level, enforced by the application (tenant id is injected at the interfaces layer, never trusted from the client body). The tenant is normally resolved from the request `Host` header via the organization's **subdomain** (default, auto-provisioned) or its **verified custom domain**.
 
 ## What "Workflow" Means Here (ClickUp Mapping)
 
@@ -15,6 +19,7 @@ ClickUp uses the term **"Workflow"** to mean *the collection of Statuses a task 
 
 | ClickUp | Our Plan |
 |---------|----------|
+| Workspace | `Organization` (the tenant) |
 | List | `Project` |
 | Status (the column on the board) | `Stage` |
 | "Workflow" (the ordered collection of statuses) | The ordered `Stage[]` owned by the `Project` — **no separate table** |
@@ -25,14 +30,29 @@ ClickUp uses the term **"Workflow"** to mean *the collection of Statuses a task 
 
 | Context | Responsibility | Aggregates |
 |---------|---------------|------------|
+| **Organization Management** | Tenancy: organization (workspace) lifecycle, membership, roles, **tenant domain (default subdomain + optional verified custom domain)** | `Organization` (root), `OrganizationMembership` |
 | **Project Management** | Project lifecycle, Stage (column) management | `Project` (root), `Stage` |
 | **Task Board** | Task lifecycle, Assignments, Comments, Attachments | `Task` (root), `TaskAssignment`, `TaskComment`, `TaskAttachment` |
-| **Reports & Analytics** | User/project dashboards, metrics, charts over task/stage movement | `DashboardReport` (query model, read-only) |
+| **Reports & Analytics** | Organization/project dashboards, metrics, charts over task/stage movement | `DashboardReport` (query model, read-only) |
 | **User Management** | Authentication, User profiles | `User` (existing) |
 
 ## Aggregate Relationships
 
 ```
+┌─────────────────────────────────────────────────────┐
+│             Organization Management                  │
+│                                                     │
+│  Organization (Aggregate Root)  [ClickUp "Workspace"]│
+│  ├── OrganizationMembership[] (Users + role)        │
+│  └── Domain (subdomain + optional custom domain)    │
+│                                                     │
+│  The tenant boundary. Every aggregate in this system │
+│  belongs to exactly one Organization.               │
+│  Host-based routing: request Host is matched to an  │
+│  Organization's subdomain or verified custom domain │
+│  before any other logic runs.                       │
+└─────────────────────────────────────────────────────┘
+
 ┌─────────────────────────────────────────────────────┐
 │                Project Management                    │
 │                                                     │
@@ -75,7 +95,11 @@ ClickUp uses the term **"Workflow"** to mean *the collection of Statuses a task 
 ## ERD
 
 ```
-User 1──N Project
+Organization 1──N Project
+Organization N──N User (via OrganizationMembership, each with a role)
+User 1──N OrganizationMembership
+User 1──N Project (creator / owner)
+Organization 1──N Task (tenant of every task)
 Project 1──N Stage (ordered by position)
 Project 1──N Task (pinned to a stage)
 Stage 1──N Task
@@ -88,6 +112,10 @@ Task 1──N TaskComment
 
 | Relation | Type | Notes |
 |----------|------|-------|
+| Organization → User | N:N | Membership (via `OrganizationMembership`), each with a role |
+| User → OrganizationMembership | 1:N | A user's memberships across organizations |
+| Organization → Project | 1:N | Projects are tenant-scoped (`organizationId`) |
+| Organization → TenantDomain | 1:1 | Default subdomain (required, unique, auto-provisioned from slug) + optional verified custom domain (unique, DNS-verified) — stored as `subdomain`, `customDomain*` fields on `Organization` |
 | User → Project | 1:N | Creator / owner |
 | Project → Stage | 1:N | Stages (columns) owned directly by the project — no pipeline (ClickUp-style) |
 | Project → Task | 1:N | Tasks belong to a project (cross-aggregate reference) |
@@ -97,6 +125,18 @@ Task 1──N TaskComment
 | Task → TaskAttachment | 1:N | File attachments (within Task aggregate) |
 
 ## Domain Entities & Value Objects
+
+### Organization Management Context
+
+| Type | Name | Description |
+|------|------|-------------|
+| **Aggregate Root** | `Organization` | A tenant / workspace. Owns projects, memberships, and the tenant's domain settings (`subdomain`, `customDomain`, verification state). `organizationId` is stamped on every tenant-owned aggregate |
+| **Entity** | `OrganizationMembership` | Links a User to an Organization with a role (OWNER/ADMIN/MEMBER/VIEWER) |
+| **Value Object** | `OrgRole` | Role levels: OWNER, ADMIN, MEMBER, VIEWER (immutable) |
+| **Value Object** | `Slug` | URL-safe unique identifier for an organization |
+| **Value Object** | `Subdomain` | Tenant's default subdomain label (lowercase alphanumeric + hyphen, 3–63 chars, unique). Auto-provisioned from the organization slug on creation; editable by OWNER/ADMIN |
+| **Value Object** | `CustomDomain` | An optional verified FQDN for the organization (e.g., `app.acme.com`). Unique across all tenants; only active after DNS verification |
+| **Value Object** | `DomainVerificationToken` | A per-organization random token the admin must publish as a TXT record (`_taskflow-verification.<domain>`) to prove ownership. Regenerated on each request |
 
 ### Project Management Context
 
@@ -136,6 +176,11 @@ Task 1──N TaskComment
 
 | Event | Source Context | Consumer | Trigger |
 |-------|---------------|----------|---------|
+| `OrganizationCreated` | Organization Management | Notifications, Reports | A workspace was created (incl. auto-generated personal org on signup); default subdomain assigned |
+| `SubdomainChanged` | Organization Management | (future) CDN/DNS cache invalidation | The owner/admin customized the organization subdomain |
+| `CustomDomainVerified` | Organization Management | Notifications, DNS cache | An owner/admin successfully verified a custom domain |
+| `CustomDomainRemoved` | Organization Management | Notifications, DNS cache | An owner/admin removed the custom domain; tenant reverts to subdomain |
+| `MemberAdded` | Organization Management | Notifications | A user joined an organization |
 | `ProjectCreated` | Project Management | Reports | New project initialized with default stages |
 | `TaskMoved` | Task Board | Reports, Notifications | Task moved between stages |
 | `TaskAssigned` | Task Board | Notifications | User assigned to task |
@@ -162,55 +207,104 @@ Reports can be built via **direct SQL aggregation** over existing tables (no new
 
 ```prisma
 model TaskSnapshot {
-  id        String    @id @default(uuid())
-  taskId    String
-  projectId String
-  stageId   String?
-  priority  TaskPriority
-  dueDate   DateTime?
-  createdAt DateTime
-  completedAt DateTime?
-  updatedAt DateTime @updatedAt
+  id           String    @id @default(uuid())
+  taskId       String
+  organizationId String
+  projectId    String
+  stageId      String?
+  priority     TaskPriority
+  dueDate      DateTime?
+  createdAt    DateTime
+  completedAt  DateTime?
+  updatedAt    DateTime @updatedAt
 
-  @@index([projectId, stageId])
-  @@index([projectId, priority])
-  @@index([projectId, createdAt])
-  @@index([projectId, completedAt])
-}
+  @@index([organizationId, projectId, stageId])
+  @@index([organizationId, projectId, priority])
 ```
 
 Populated/refreshed by a worker consuming `TaskMoved`, `TaskCompleted`, `TaskCreated` events.
 
 ## Prisma Schema
 
+### Organization Management Context
+
+```prisma
+enum OrgRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model Organization {
+  id                           String                   @id @default(uuid())
+  name                         String
+  slug                         String                   @unique
+  ownerId                      String
+  owner                        User                     @relation("OrganizationOwner", fields: [ownerId], references: [id])
+  // ── tenant domain settings ──────────────────────────────────
+  subdomain                    String                   @unique      // default subdomain label (<slug> at creation), e.g. "acme"
+  customDomain                 String?                  @unique      // optional verified FQDN, e.g. "app.acme.com"
+  customDomainVerificationToken String?                              // TXT record token ("_taskflow-verification.<customDomain>")
+  customDomainVerifiedAt       DateTime?                              // null until DNS verified
+  // ── relationships ───────────────────────────────────────────
+  members                      OrganizationMembership[]
+  projects                     Project[]
+  tasks                        Task[]
+  createdAt                    DateTime                 @default(now())
+  updatedAt                    DateTime                 @updatedAt
+
+  @@index([ownerId])
+  @@index([subdomain])
+}
+
+model OrganizationMembership {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation("OrgMember", fields: [userId], references: [id], onDelete: Cascade)
+  role           OrgRole      @default(MEMBER)
+  joinedAt       DateTime     @default(now())
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+```
+
 ### Project Management Context
 
 ```prisma
 model Project {
-  id          String   @id @default(uuid())
-  name        String
-  description String?  @db.Text
-  ownerId     String
-  owner       User     @relation("ProjectOwner", fields: [ownerId], references: [id])
-  stages      Stage[]
-  tasks       Task[]
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?      @db.Text
+  ownerId        String
+  owner          User         @relation("ProjectOwner", fields: [ownerId], references: [id])
+  stages         Stage[]
+  tasks          Task[]
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
+  @@index([organizationId])
   @@index([ownerId])
 }
 
 model Stage {
-  id        String  @id @default(uuid())
-  projectId String
-  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  name      String
-  position  Int
-  color     String? @default("#6366f1")
-  isDone    Boolean @default(false)
-  tasks     Task[]
+  id             String  @id @default(uuid())
+  organizationId String
+  projectId      String
+  project        Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name           String
+  position       Int
+  color          String? @default("#6366f1")
+  isDone         Boolean @default(false)
+  tasks          Task[]
 
   @@unique([projectId, position])
+  @@index([organizationId])
   @@index([projectId])
 }
 ```
@@ -221,25 +315,27 @@ model Stage {
 
 ```prisma
 model Task {
-  id           String           @id @default(uuid())
-  title        String
-  description  String?          @db.Text
-  projectId    String
-  project      Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  stageId      String?
-  stage        Stage?           @relation(fields: [stageId], references: [id], onDelete: SetNull)
-  position     Int              @default(0)
-  priority     TaskPriority     @default(MEDIUM)
-  dueDate      DateTime?
-  completedAt  DateTime?
-  creatorId    String
-  creator      User             @relation("TaskCreator", fields: [creatorId], references: [id])
-  assignments  TaskAssignment[]
-  comments     TaskComment[]
-  attachments  TaskAttachment[]
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+  id             String           @id @default(uuid())
+  organizationId String
+  title          String
+  description    String?          @db.Text
+  projectId      String
+  project        Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  stageId        String?
+  stage          Stage?           @relation(fields: [stageId], references: [id], onDelete: SetNull)
+  position       Int              @default(0)
+  priority       TaskPriority     @default(MEDIUM)
+  dueDate        DateTime?
+  completedAt    DateTime?
+  creatorId      String
+  creator        User             @relation("TaskCreator", fields: [creatorId], references: [id])
+  assignments    TaskAssignment[]
+  comments       TaskComment[]
+  attachments    TaskAttachment[]
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
 
+  @@index([organizationId])
   @@index([projectId])
   @@index([stageId])
   @@index([creatorId])
@@ -281,16 +377,23 @@ enum TaskPriority {
 
 ### Existing Models to Update
 
-- **User**: add `projects Project[]`, `assignments TaskAssignment[]`, `comments TaskComment[]`
+- **User**: add `organizationMemberships OrganizationMembership[]`, `ownedOrganizations Organization[]`, `projects Project[]`, `assignments TaskAssignment[]`, `comments TaskComment[]`
+- **Organization / OrganizationMembership**: new models — the tenant boundary and membership/roles; add subdomain/customDomain fields + TXT verification token + verifiedAt
+- **Project / Stage / Task**: add `organizationId` (tenant anchor) + `@@index([organizationId])`
 - **TaskAttachment**: update `uploadedBy` relation to match new Task model
 - **Task**: add `completedAt DateTime?` to track when a task reached a done stage (needed for velocity/throughput reports)
 - Remove old `Task` model (replaced with the new one above)
 - Remove old `TaskStatus` enum (replaced by stage position + priority)
 
-## Migration Strategy
+## Migration Strategy (incl. tenancy)
 
-1. Create new models (`Project`, `Stage`, `TaskAssignment`, `TaskComment`)
-2. Rename old `Task` → `LegacyTask` temporarily
-3. Create new `Task` model
-4. Migrate data from `LegacyTask` → `Task` (map old `TaskStatus` enum to default project stages)
-5. Drop `LegacyTask` and old `TaskStatus` enum
+1. Create `Organization` + `OrganizationMembership` models + tenant domain columns (`subdomain`, `customDomain`, `customDomainVerificationToken`, `customDomainVerifiedAt`)
+2. Backfill: create a **personal Organization per existing User** (owner = user, role = OWNER) — slug = sanitized user name/id, **subdomain = slug** (unique constraint enforced; append random suffix on collision)
+3. Verify `subdomain` uniqueness after backfill; add `@@index([subdomain])`
+3. Add `organizationId` to `Project`, `Stage`, `Task`; assign each row to its owner's personal organization
+4. Create new models (`Project`, `Stage`, `TaskAssignment`, `TaskComment`)
+5. Rename old `Task` → `LegacyTask` temporarily
+6. Create new `Task` model
+7. Migrate data from `LegacyTask` → `Task` (map old `TaskStatus` enum to default project stages)
+8. Drop `LegacyTask` and old `TaskStatus` enum
+9. Enforce `organizationId NOT NULL` + tenant indexes **after** backfill is verified
