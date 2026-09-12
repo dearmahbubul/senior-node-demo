@@ -7,6 +7,7 @@ export const envSchema = z
         DATABASE_URL: z.url(),
         JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 characters'),
         LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+        APP_BASE_HOST: z.string().min(1).default('localhost'),
         RABBITMQ_URL: z.url().default('amqp://admin:admin@localhost:5672'),
         REDIS_URL: z.url().default('redis://localhost:6379'),
 

@@ -15,16 +15,59 @@ enum TaskStatus {
   DONE
 }
 
+enum OrgRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
 model User {
-  id             String    @id @default(uuid())
-  name           String?
-  email          String    @unique
-  passwordHash   String
-  phone          String?
-  createdAt      DateTime  @default(now())
-  tasksCreated   Task[]    @relation("TaskCreator")
-  tasksAssigned  Task[]    @relation("TaskAssignee")
-  attachmentsUploaded TaskAttachment[] @relation("TaskAttachmentUploader")
+  id                  String                  @id @default(uuid())
+  name                String?
+  email               String                  @unique
+  passwordHash        String
+  phone               String?
+  createdAt           DateTime                @default(now())
+  tasksCreated        Task[]                  @relation("TaskCreator")
+  tasksAssigned       Task[]                  @relation("TaskAssignee")
+  attachmentsUploaded TaskAttachment[]        @relation("TaskAttachmentUploader")
+  memberships         OrganizationMembership[] @relation("OrgMember")
+  ownedOrganizations  Organization[]          @relation("OrganizationOwner")
+}
+
+model Organization {
+  id                           String                   @id @default(uuid())
+  name                         String
+  slug                         String                   @unique
+  ownerId                      String
+  owner                        User                     @relation("OrganizationOwner", fields: [ownerId], references: [id])
+  // default tenant subdomain (auto-provisioned from slug at creation), e.g. "acme"
+  subdomain                    String                   @unique
+  // optional verified custom FQDN, e.g. "app.acme.com"
+  customDomain                 String?                  @unique
+  // DNS TXT token ("_taskflow-verification.<customDomain>")
+  customDomainVerificationToken String?
+  // null until the custom domain passes DNS verification
+  customDomainVerifiedAt       DateTime?
+  members                      OrganizationMembership[]
+  createdAt                    DateTime                 @default(now())
+  updatedAt                    DateTime                 @updatedAt
+
+  @@index([ownerId])
+}
+
+model OrganizationMembership {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation("OrgMember", fields: [userId], references: [id], onDelete: Cascade)
+  role           OrgRole      @default(MEMBER)
+  joinedAt       DateTime     @default(now())
+
+  @@unique([organizationId, userId])
+  @@index([userId])
 }
 
 model Task {

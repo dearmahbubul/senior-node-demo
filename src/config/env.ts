@@ -20,6 +20,7 @@ export const env = {
     logLevel: raw.LOG_LEVEL,
     rabbitmqUrl: raw.RABBITMQ_URL,
     redisUrl: raw.REDIS_URL,
+    appBaseHost: raw.APP_BASE_HOST,
     storage: {
         driver: raw.STORAGE_DRIVER,
         uploadDir: raw.UPLOAD_DIR,
