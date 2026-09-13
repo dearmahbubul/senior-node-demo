@@ -1,7 +1,9 @@
 import { PrismaOrganizationRepository } from './infrastructure/persistence/prisma-organization.repository';
 import { PrismaOrganizationMembershipRepository } from './infrastructure/persistence/prisma-organization-membership.repository';
+import { PrismaOrganizationQuery } from './infrastructure/persistence/prisma-organization.query';
 import { DnsVerificationAdapter } from './infrastructure/verification/dns-verification.adapter';
 import { LogOrganizationEventPublisher } from './infrastructure/events/organization-event-publisher.adapter';
+import type { OrganizationQueryPort } from './domain/ports/organization.query.port';
 
 import { CreateOrganizationUseCase } from './application/create-organization.use-case';
 import { GetOrganizationUseCase } from './application/get-organization.use-case';
@@ -29,6 +31,12 @@ const organizationRepository = new PrismaOrganizationRepository();
 const membershipRepository = new PrismaOrganizationMembershipRepository();
 const domainVerification = new DnsVerificationAdapter();
 const eventPublisher = new LogOrganizationEventPublisher();
+
+// Read-side query adapter — reused by common middleware and HTTP controllers.
+export const organizationQueries: OrganizationQueryPort = new PrismaOrganizationQuery(
+    organizationRepository,
+    membershipRepository,
+);
 
 export const createOrganizationUseCase = new CreateOrganizationUseCase(
     organizationRepository,

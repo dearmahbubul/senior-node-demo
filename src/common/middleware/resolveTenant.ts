@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { AppError } from '../errors/AppError';
 import { env } from '@config/env';
-import { organizationQueries } from '@modules/organization-management/organization-queries';
+import { organizationQueries } from '@modules/organization-management';
 
 /**
  * Host-based tenant resolution: maps the `Host` header (custom domain first,

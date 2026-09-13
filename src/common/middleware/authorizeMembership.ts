@@ -1,10 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { AppError } from '../errors/AppError';
-import {
-    hasMinimumRole,
-    OrgRole,
-} from '@modules/organization-management/domain/value-objects/org-role.vo';
-import { organizationQueries } from '@modules/organization-management/organization-queries';
+import { hasMinimumRole, OrgRole, organizationQueries } from '@modules/organization-management';
 
 export interface AuthorizeMembershipOptions {
     /** Minimum role required for the route (defaults to any membership). */

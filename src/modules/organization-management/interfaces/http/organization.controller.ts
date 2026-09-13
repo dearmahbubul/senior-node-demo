@@ -1,7 +1,6 @@
 import { Request, Response } from 'express';
 import { ApiResponse } from '@common/types/response';
 import { asyncHandler } from '@common/utils/asyncHandler';
-import { organizationQueries } from '../../organization-queries';
 import {
     createOrganizationUseCase,
     getOrganizationUseCase,
@@ -12,6 +11,7 @@ import {
     listMembersUseCase,
     updateMemberRoleUseCase,
     removeMemberUseCase,
+    organizationQueries,
 } from '../../composition';
 import { organizationResource, membershipResource } from './organization.resource';
 import {
